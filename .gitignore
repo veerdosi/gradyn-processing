@@ -1,0 +1,52 @@
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local caches and secrets
+.cache/
+.env
+.env.*
+!.env.example
+
+# Upstream repositories and downloaded model weights
+models/
+
+# Licensed MANO/SMPL assets must never be committed
+mano_v1_2/
+licensed_models/
+**/MANO_LEFT.pkl
+**/MANO_RIGHT.pkl
+**/SMPLH_*.pkl
+
+# Videos and generated processing results
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+result/
+result-*/
+result_*/
+outputs/
+output/
+
+# Local/internal working notes
+PROGRESS.md
+
+# Temporary downloads and logs
+*.partial
+*.download
+*.log

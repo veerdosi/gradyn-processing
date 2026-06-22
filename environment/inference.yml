@@ -1,0 +1,13 @@
+name: gradyn-inference
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - numpy=1.26
+  - libopenblas=*=*pthreads*
+  - scipy
+  - scikit-image
+  - pandas
+  - pyarrow
+  - ffmpeg
+  - pip

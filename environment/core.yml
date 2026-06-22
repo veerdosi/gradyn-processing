@@ -1,0 +1,15 @@
+name: gradyn-core
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - ffmpeg>=7
+  - numpy=1.26
+  - pillow
+  - pyarrow
+  - scipy
+  - typer
+  - pydantic
+  - rich
+  - pytest
+  - pip

@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "name": "sample-metalwork",
+  "description": "Object prompts tailored to sample.MP4: egocentric fabrication and welding.",
+  "task": "metal fabrication and welding",
+  "prompts": [
+    "welding torch",
+    "welding gun",
+    "welding electrode",
+    "electrode holder",
+    "angle grinder",
+    "power drill",
+    "clamp",
+    "locking pliers",
+    "magnetic welding holder",
+    "pliers",
+    "hammer",
+    "metal workpiece",
+    "metal sheet",
+    "metal bar",
+    "welding cable",
+    "hand tool"
+  ]
+}

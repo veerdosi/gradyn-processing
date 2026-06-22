@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "profile_id": "dji-osmo-nano-rswide-1080p30",
+  "camera_make_model": "DJI Osmo Nano",
+  "aliases": ["dji osmo nano", "osmo nano"],
+  "video": {
+    "width": 1920,
+    "height": 1080,
+    "nominal_fps": 29.97002997002997,
+    "aspect_ratio": "16:9"
+  },
+  "manufacturer_lens_metadata": {
+    "advertised_diagonal_fov_deg": 143.0,
+    "aperture_f_number": 2.8
+  },
+  "capture_mode": {
+    "camera_setting": "RSWIDE1080P30FPS",
+    "lens_fov_mode": "wide",
+    "stabilization_mode": "rocksteady_on",
+    "dewarping_mode": "unknown",
+    "digital_zoom": "unknown"
+  },
+  "intrinsics": {
+    "status": "nominal_uncalibrated",
+    "principal_point_px": [960.0, 540.0],
+    "rectilinear_focal_from_advertised_diagonal_fov_px": 368.54121420354716,
+    "equidistant_fisheye_focal_from_advertised_diagonal_fov_px": 882.6383461875769,
+    "distortion_model": "unknown",
+    "distortion_coefficients": null,
+    "wilor_projection_policy": "image_size_heuristic",
+    "wilor_projection_focal_length_px": 1536.0
+  },
+  "notes": [
+    "Resolution, frame rate, and aspect ratio can be verified from the MP4.",
+    "The advertised FOV does not identify whether delivered video is rectilinear, fisheye, dewarped, cropped, or stabilized.",
+    "RSWIDE1080P30FPS, Wide FOV, and RockSteady enabled are user-declared capture settings.",
+    "The f/2.8 aperture does not determine radial or tangential distortion.",
+    "Nominal FOV-derived focal estimates are provenance only and are not used for WiLoR projection.",
+    "WiLoR retains its image-size focal heuristic because hand overlay alignment is validated independently in image space."
+  ]
+}

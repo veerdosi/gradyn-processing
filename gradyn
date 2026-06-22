@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -n "${GRADYN_CONDA:-}" && -x "${GRADYN_CONDA}" ]]; then
+  CONDA_BIN="$GRADYN_CONDA"
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_BIN="$(command -v conda)"
+else
+  for candidate in \
+    "$HOME/miniconda3/bin/conda" \
+    "$HOME/anaconda3/bin/conda" \
+    "/opt/miniconda3/bin/conda" \
+    "/opt/anaconda3/bin/conda"; do
+    if [[ -x "$candidate" ]]; then
+      CONDA_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${CONDA_BIN:-}" ]]; then
+  echo "Conda was not found. Run ./setup.sh after installing Miniconda." >&2
+  exit 1
+fi
+
+cd "$ROOT"
+exec "$CONDA_BIN" run --no-capture-output -n gradyn-core gradyn "$@"
