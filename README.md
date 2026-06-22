@@ -23,13 +23,12 @@ See [output schema](docs/OUTPUT_SCHEMA.md) and [architecture](docs/ARCHITECTURE.
 
 ## First-time setup
 
-Clone the repository, place the licensed MANO files somewhere on the Mac, then run one
-command:
+Clone the repository and run one command:
 
 ```bash
 git clone https://github.com/YOUR_ORG/gradyn-processing.git
 cd gradyn-processing
-./setup.sh --mano-dir /path/to/mano_v1_2/models
+./setup.sh
 ```
 
 The setup command:
@@ -38,14 +37,17 @@ The setup command:
 - creates four isolated Conda environments;
 - installs each upstream project in its compatible environment;
 - downloads and validates all weights needed by the normal explicit-object pipeline;
-- installs the user-supplied licensed MANO files;
+- downloads the configured MANO left/right files into ignored local storage, verifies their
+  known hashes, and installs them for WiLoR;
 - runs model verification and the test suite.
 
 It finds Conda from the active shell, common Miniconda/Anaconda locations, or
 `GRADYN_CONDA=/path/to/conda`. Re-running `./setup.sh` updates and repairs an existing
 installation instead of requiring a clean machine.
 
-MANO requires authenticated acceptance of its license and cannot be downloaded automatically:
+MANO remains subject to its own license. The configured shared source must only be used by
+people authorized to use those model files. To use an existing licensed MANO directory
+instead:
 
 ```bash
 ./setup.sh --mano-dir /path/to/mano_v1_2/models
@@ -55,7 +57,7 @@ Qwen is optional and not downloaded for production runs with explicit object nam
 it only when automatic vocabulary discovery is needed:
 
 ```bash
-./setup.sh --mano-dir /path/to/mano_v1_2/models --with-qwen
+./setup.sh --with-qwen
 ```
 
 Gradyn uses `curl` with visible progress, retries, resumable partial files, and exact

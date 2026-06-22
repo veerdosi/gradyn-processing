@@ -13,3 +13,5 @@ dependencies:
   - rich
   - pytest
   - pip
+  - pip:
+      - gdown==5.2.0

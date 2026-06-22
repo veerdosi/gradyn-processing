@@ -4,18 +4,24 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WITH_QWEN=0
 MANO_DIR="${GRADYN_MANO_DIR:-}"
+MANO_DOWNLOAD_DIR="$ROOT/licensed_models/mano_v1_2/models"
+MANO_LEFT_ID="1scfcvug_hc_VvYl-vKHouic8Xd9lgUXE"
+MANO_RIGHT_ID="1nWOkgnUFqS9IVUG5_tTXjPaSmflwNLQ6"
+MANO_LEFT_SHA256="c4022f7083f2ca7c78b2b3d595abbab52debd32b09d372b16923a801f0ea6a30"
+MANO_RIGHT_SHA256="45d60aa3b27ef9107a7afd4e00808f307fd91111e1cfa35afd5c4a62de264767"
 
 usage() {
   cat <<'EOF'
 Usage: ./setup.sh [--with-qwen] [--mano-dir /path/to/models]
 
 Creates all Conda environments, installs Gradyn, clones pinned upstream
-repositories, downloads required public checkpoints, installs licensed MANO
-files when provided, and verifies the installation.
+repositories, downloads required model files including MANO, and verifies the
+installation.
 
 Options:
   --with-qwen       Download the optional Qwen3-VL object-discovery model.
-  --mano-dir PATH   Directory containing MANO_RIGHT.pkl and MANO_LEFT.pkl.
+  --mano-dir PATH   Use an existing licensed MANO directory instead of the
+                    configured Gradyn download.
 EOF
 }
 
@@ -120,17 +126,41 @@ if [[ -z "$MANO_DIR" ]]; then
   done
 fi
 
-if [[ -n "$MANO_DIR" && -f "$MANO_DIR/MANO_RIGHT.pkl" && -f "$MANO_DIR/MANO_LEFT.pkl" ]]; then
-  "$CONDA_BIN" run -n gradyn-core gradyn models install-mano \
-    --right "$MANO_DIR/MANO_RIGHT.pkl" \
-    --left "$MANO_DIR/MANO_LEFT.pkl"
-else
-  echo
-  echo "MANO files were not found."
-  echo "Download them under your MANO license, then run:"
-  echo "  ./setup.sh --mano-dir /path/to/mano_v1_2/models"
+verify_sha256() {
+  local path="$1"
+  local expected="$2"
+  [[ -f "$path" ]] || return 1
+  [[ "$(shasum -a 256 "$path" | awk '{print $1}')" == "$expected" ]]
+}
+
+if [[ -z "$MANO_DIR" ]]; then
+  mkdir -p "$MANO_DOWNLOAD_DIR"
+  if ! verify_sha256 "$MANO_DOWNLOAD_DIR/MANO_LEFT.pkl" "$MANO_LEFT_SHA256"; then
+    rm -f "$MANO_DOWNLOAD_DIR/MANO_LEFT.pkl"
+    echo "Downloading licensed MANO_LEFT.pkl…"
+    "$CONDA_BIN" run --no-capture-output -n gradyn-core gdown \
+      "https://drive.google.com/uc?id=$MANO_LEFT_ID" \
+      --output "$MANO_DOWNLOAD_DIR/MANO_LEFT.pkl"
+  fi
+  if ! verify_sha256 "$MANO_DOWNLOAD_DIR/MANO_RIGHT.pkl" "$MANO_RIGHT_SHA256"; then
+    rm -f "$MANO_DOWNLOAD_DIR/MANO_RIGHT.pkl"
+    echo "Downloading licensed MANO_RIGHT.pkl…"
+    "$CONDA_BIN" run --no-capture-output -n gradyn-core gdown \
+      "https://drive.google.com/uc?id=$MANO_RIGHT_ID" \
+      --output "$MANO_DOWNLOAD_DIR/MANO_RIGHT.pkl"
+  fi
+  MANO_DIR="$MANO_DOWNLOAD_DIR"
+fi
+
+if ! verify_sha256 "$MANO_DIR/MANO_LEFT.pkl" "$MANO_LEFT_SHA256" ||
+  ! verify_sha256 "$MANO_DIR/MANO_RIGHT.pkl" "$MANO_RIGHT_SHA256"; then
+  echo "MANO files failed integrity verification: $MANO_DIR" >&2
   exit 2
 fi
+
+"$CONDA_BIN" run -n gradyn-core gradyn models install-mano \
+  --right "$MANO_DIR/MANO_RIGHT.pkl" \
+  --left "$MANO_DIR/MANO_LEFT.pkl"
 
 verify_args=()
 if [[ "$WITH_QWEN" -eq 1 ]]; then
