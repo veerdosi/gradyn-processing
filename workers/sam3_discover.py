@@ -170,11 +170,11 @@ def select_auto_labels(
     return filtered, summary
 
 
-def select_with_exemplar(
+def _histogram_similarity(
     image: Image.Image, masks: np.ndarray, exemplar_path: str | None
-) -> int:
-    if not exemplar_path or len(masks) <= 1:
-        return 0
+) -> np.ndarray:
+    if not exemplar_path:
+        return np.zeros(len(masks), dtype=np.float32)
     exemplar = np.asarray(
         Image.open(exemplar_path).convert("RGB").resize((128, 128)),
         dtype=np.float32,
@@ -185,11 +185,11 @@ def select_with_exemplar(
             for channel in range(3)
         ]
     )
-    scores: list[float] = []
+    similarities: list[float] = []
     for mask in masks:
         pixels = np.asarray(image, dtype=np.float32)[mask]
         if not len(pixels):
-            scores.append(float("-inf"))
+            similarities.append(0.0)
             continue
         candidate_hist = np.concatenate(
             [
@@ -198,10 +198,243 @@ def select_with_exemplar(
             ]
         )
         denominator = np.linalg.norm(exemplar_hist) * np.linalg.norm(candidate_hist)
-        scores.append(
+        similarities.append(
             float(np.dot(exemplar_hist, candidate_hist) / max(denominator, 1e-9))
         )
-    return int(np.argmax(scores))
+    return np.asarray(similarities, dtype=np.float32)
+
+
+def _box_iou(left: np.ndarray, right: np.ndarray) -> float:
+    x0 = max(float(left[0]), float(right[0]))
+    y0 = max(float(left[1]), float(right[1]))
+    x1 = min(float(left[2]), float(right[2]))
+    y1 = min(float(left[3]), float(right[3]))
+    intersection = max(x1 - x0, 0.0) * max(y1 - y0, 0.0)
+    left_area = max(float(left[2] - left[0]), 0.0) * max(
+        float(left[3] - left[1]), 0.0
+    )
+    right_area = max(float(right[2] - right[0]), 0.0) * max(
+        float(right[3] - right[1]), 0.0
+    )
+    return intersection / max(left_area + right_area - intersection, 1e-9)
+
+
+def _box_area(box: np.ndarray) -> float:
+    return max(float(box[2] - box[0]), 0.0) * max(float(box[3] - box[1]), 0.0)
+
+
+def _box_intersection(left: np.ndarray, right: np.ndarray) -> float:
+    x0 = max(float(left[0]), float(right[0]))
+    y0 = max(float(left[1]), float(right[1]))
+    x1 = min(float(left[2]), float(right[2]))
+    y1 = min(float(left[3]), float(right[3]))
+    return max(x1 - x0, 0.0) * max(y1 - y0, 0.0)
+
+
+def box_prompt_alignment(
+    candidate_box: np.ndarray,
+    prompt_box: np.ndarray | None,
+    image_size: tuple[int, int],
+) -> dict[str, float]:
+    if prompt_box is None:
+        return {
+            "box_prompt_iou": 0.0,
+            "box_prompt_center_similarity": 0.0,
+            "box_prompt_candidate_inside": 0.0,
+            "box_prompt_coverage": 0.0,
+            "box_prompt_area_ratio": 0.0,
+            "box_prompt_agreement": 0.0,
+        }
+    width, height = image_size
+    diagonal = max(float(np.hypot(width, height)), 1.0)
+    candidate = np.asarray(candidate_box, dtype=np.float32)
+    prompt = np.asarray(prompt_box, dtype=np.float32)
+    candidate_area = _box_area(candidate)
+    prompt_area = _box_area(prompt)
+    intersection = _box_intersection(candidate, prompt)
+    candidate_center = np.asarray(
+        [
+            (candidate[0] + candidate[2]) / 2.0,
+            (candidate[1] + candidate[3]) / 2.0,
+        ],
+        dtype=np.float32,
+    )
+    prompt_center = np.asarray(
+        [(prompt[0] + prompt[2]) / 2.0, (prompt[1] + prompt[3]) / 2.0],
+        dtype=np.float32,
+    )
+    center_similarity = float(
+        np.exp(
+            -3.0
+            * np.linalg.norm(candidate_center - prompt_center)
+            / diagonal
+        )
+    )
+    candidate_inside = float(intersection / max(candidate_area, 1e-9))
+    prompt_coverage = float(intersection / max(prompt_area, 1e-9))
+    iou = _box_iou(candidate, prompt)
+    area_ratio = float(candidate_area / max(prompt_area, 1e-9))
+    # A loose proposal is acceptable if SAM returns a tighter object inside it.
+    # The reverse is risky: a prompted mask that balloons beyond the proposal is
+    # often a background/work-surface leak.
+    agreement = float(
+        0.35 * iou
+        + 0.35 * center_similarity
+        + 0.30 * candidate_inside
+    )
+    return {
+        "box_prompt_iou": float(iou),
+        "box_prompt_center_similarity": center_similarity,
+        "box_prompt_candidate_inside": candidate_inside,
+        "box_prompt_coverage": prompt_coverage,
+        "box_prompt_area_ratio": area_ratio,
+        "box_prompt_agreement": agreement,
+    }
+
+
+def prompt_anchor_rejection_reason(metrics: dict[str, float]) -> str | None:
+    if metrics["box_prompt_area_ratio"] >= 3.5 and metrics[
+        "box_prompt_candidate_inside"
+    ] < 0.55:
+        return "box_prompt_mask_expanded_outside_proposal"
+    if (
+        metrics["box_prompt_center_similarity"] < 0.45
+        and metrics["box_prompt_iou"] < 0.05
+    ):
+        return "box_prompt_mask_landed_elsewhere"
+    if (
+        metrics["box_prompt_iou"] < 0.03
+        and metrics["box_prompt_candidate_inside"] < 0.15
+        and metrics["box_prompt_coverage"] < 0.15
+    ):
+        return "box_prompt_mask_disagrees_with_proposal"
+    return None
+
+
+def select_object_candidate(
+    image: Image.Image,
+    masks: np.ndarray,
+    boxes: np.ndarray,
+    semantic_scores: np.ndarray,
+    exemplar_path: str | None = None,
+    previous_box: np.ndarray | None = None,
+    prompt_box: np.ndarray | None = None,
+    prompt_trust: float = 1.0,
+) -> tuple[int, list[dict[str, float]]]:
+    """Choose the foreground task instance, not merely the best text match.
+
+    Egocentric work videos often contain several members of the same class:
+    the sheet being handled, a stack at the image edge, and completed sheets in
+    the machine. SAM 3's semantic score alone cannot distinguish those roles.
+    """
+    width, height = image.size
+    diagonal = max(float(np.hypot(width, height)), 1.0)
+    image_area = max(float(width * height), 1.0)
+    exemplar_scores = _histogram_similarity(image, masks, exemplar_path)
+    diagnostics: list[dict[str, float]] = []
+
+    for index, (mask, box, semantic_score) in enumerate(
+        zip(masks, boxes, semantic_scores, strict=True)
+    ):
+        x0, y0, x1, y1 = [float(value) for value in box]
+        center_x = (x0 + x1) / 2.0
+        center_y = (y0 + y1) / 2.0
+        # The useful workspace in a head-mounted view is usually around the
+        # middle and slightly below center. This is a prior, not a hard crop.
+        focus_distance = np.hypot(
+            center_x - 0.50 * width, center_y - 0.56 * height
+        )
+        centrality = float(np.exp(-3.0 * focus_distance / diagonal))
+        mask_fraction = float(mask.sum() / image_area)
+        area_support = float(np.clip(np.sqrt(mask_fraction / 0.10), 0.0, 1.0))
+
+        continuity = 0.5
+        if previous_box is not None:
+            previous_pixels = np.asarray(previous_box, dtype=np.float32).copy()
+            if float(np.max(previous_pixels)) <= 1.5:
+                previous_pixels *= np.asarray(
+                    [width, height, width, height], dtype=np.float32
+                )
+            previous_center = np.asarray(
+                [
+                    (previous_pixels[0] + previous_pixels[2]) / 2.0,
+                    (previous_pixels[1] + previous_pixels[3]) / 2.0,
+                ],
+                dtype=np.float32,
+            )
+            center_similarity = float(
+                np.exp(
+                    -3.0
+                    * np.linalg.norm(
+                        np.asarray([center_x, center_y], dtype=np.float32)
+                        - previous_center
+                    )
+                    / diagonal
+                )
+            )
+            continuity = 0.55 * center_similarity + 0.45 * _box_iou(
+                box, previous_pixels
+            )
+
+        edge_penalty = 0.0
+        touches_top = y0 <= 0.035 * height
+        touches_side = x0 <= 0.02 * width or x1 >= 0.98 * width
+        if touches_top:
+            edge_penalty += 0.24
+        if touches_side:
+            edge_penalty += 0.08
+
+        prompt_metrics = box_prompt_alignment(
+            box,
+            prompt_box,
+            (width, height),
+        )
+        prompt_weight = (
+            0.15 * max(0.0, min(1.0, float(prompt_trust)))
+            if prompt_box is not None
+            else 0.0
+        )
+        if exemplar_path:
+            prompt_fraction = prompt_weight / 0.15 if prompt_weight else 0.0
+            semantic_weight = 0.30 - 0.05 * prompt_fraction
+            centrality_weight = 0.15 - 0.03 * prompt_fraction
+            exemplar_weight = 0.30 - 0.05 * prompt_fraction
+            total = (
+                semantic_weight * float(semantic_score)
+                + centrality_weight * centrality
+                + 0.10 * area_support
+                + 0.13 * continuity
+                + exemplar_weight * float(exemplar_scores[index])
+                + prompt_weight * prompt_metrics["box_prompt_agreement"]
+                - edge_penalty
+            )
+        else:
+            prompt_fraction = prompt_weight / 0.15 if prompt_weight else 0.0
+            semantic_weight = 0.45 - 0.09 * prompt_fraction
+            centrality_weight = 0.25 - 0.05 * prompt_fraction
+            area_weight = 0.15 - 0.03 * prompt_fraction
+            total = (
+                semantic_weight * float(semantic_score)
+                + centrality_weight * centrality
+                + area_weight * area_support
+                + 0.12 * continuity
+                + prompt_weight * prompt_metrics["box_prompt_agreement"]
+                - edge_penalty
+            )
+        diagnostics.append(
+            {
+                "total": float(total),
+                "semantic": float(semantic_score),
+                "centrality": centrality,
+                "area_support": area_support,
+                "continuity": float(continuity),
+                "edge_penalty": float(edge_penalty),
+                "exemplar": float(exemplar_scores[index]),
+                **prompt_metrics,
+            }
+        )
+
+    return int(np.argmax([item["total"] for item in diagnostics])), diagnostics
 
 
 def main() -> None:
@@ -211,6 +444,7 @@ def main() -> None:
     parser.add_argument("--candidate-prompts-json")
     parser.add_argument("--candidate-source", default="external_candidates")
     parser.add_argument("--manual-seeds-json")
+    parser.add_argument("--box-proposals-json")
     parser.add_argument("--prompt-bank")
     parser.add_argument("--max-auto-objects", type=int, default=8)
     parser.add_argument("--exemplars-json", required=True)
@@ -268,6 +502,15 @@ def main() -> None:
         ]
         for seed in manual_seeds
     }
+    box_proposals: dict[tuple[int, str], dict] = {}
+    if args.box_proposals_json:
+        proposal_path = Path(args.box_proposals_json)
+        if proposal_path.exists():
+            proposal_data = json.loads(proposal_path.read_text())
+            for proposal in proposal_data.get("boxes", []):
+                key = (int(proposal["frame_index"]), str(proposal["label"]))
+                if proposal.get("found") and proposal.get("box_xyxy"):
+                    box_proposals[key] = proposal
     keyframes = sorted(
         set(
             [
@@ -293,9 +536,16 @@ def main() -> None:
         "max_side": args.max_side,
         "exemplars": exemplars,
         "manual_seeds": manual_seeds,
+        "box_proposals": (
+            str(Path(args.box_proposals_json).resolve())
+            if args.box_proposals_json
+            else None
+        ),
+        "instance_selector": "text_first_optional_box_v3",
     }
     discoveries: list[dict] = []
     completed_keyframes: set[int] = set()
+    checkpointed_by_frame: dict[int, list[dict]] = {}
     if checkpoint_meta.exists():
         checkpoint = json.loads(checkpoint_meta.read_text())
         if checkpoint.get("signature") != signature:
@@ -305,7 +555,9 @@ def main() -> None:
     for frame_index in keyframes:
         frame_checkpoint = checkpoint_dir / f"{frame_index:08d}.json"
         if frame_checkpoint.exists():
-            discoveries.extend(json.loads(frame_checkpoint.read_text()))
+            cached = json.loads(frame_checkpoint.read_text())
+            discoveries.extend(cached)
+            checkpointed_by_frame[frame_index] = cached
             completed_keyframes.add(frame_index)
 
     weights_dir = root / "models" / "mlx-sam3" / "weights" / "sam3-image"
@@ -325,8 +577,26 @@ def main() -> None:
         f"SAM 3 will inspect {len(keyframes)} keyframes with {len(objects)} prompts.",
         flush=True,
     )
+    previous_box_by_label: dict[str, np.ndarray] = {}
+    consecutive_misses: dict[str, int] = {}
+    source_width, source_height = Image.open(frames[0]).size
+    source_box_scale = np.asarray(
+        [source_width, source_height, source_width, source_height],
+        dtype=np.float32,
+    )
     for keyframe_number, frame_index in enumerate(keyframes, start=1):
         if frame_index in completed_keyframes:
+            for item in checkpointed_by_frame[frame_index]:
+                label = str(item["label"])
+                if item.get("found"):
+                    previous_box_by_label[label] = np.asarray(
+                        item["box_xyxy"], dtype=np.float32
+                    ) / source_box_scale
+                    consecutive_misses[label] = 0
+                else:
+                    consecutive_misses[label] = consecutive_misses.get(label, 0) + 1
+                    if consecutive_misses[label] >= 2:
+                        previous_box_by_label.pop(label, None)
             print(f"↷ SAM 3 reusing source frame {frame_index}", flush=True)
             continue
         print(
@@ -339,32 +609,126 @@ def main() -> None:
         state = processor.set_image(image)
         frame_discoveries: list[dict] = []
         for object_id, label in enumerate(objects, start=1):
-            processor.reset_all_prompts(state)
-            state = processor.set_text_prompt(label, state)
             manual_box = seed_by_frame_label.get((frame_index, label))
-            if manual_box is not None:
-                x0, y0, x1, y1 = manual_box
-                state = processor.add_geometric_prompt(
-                    box=[
-                        ((x0 + x1) / 2) / original.width,
-                        ((y0 + y1) / 2) / original.height,
-                        (x1 - x0) / original.width,
-                        (y1 - y0) / original.height,
-                    ],
-                    label=True,
-                    state=state,
+            proposal_key = (frame_index, label)
+            proposal = box_proposals.get(proposal_key)
+            proposal_box = (
+                [float(value) for value in proposal["box_xyxy"]]
+                if proposal is not None
+                else None
+            )
+            prompt_box = manual_box if manual_box is not None else proposal_box
+            prompt_box_for_image = (
+                np.asarray(prompt_box, dtype=np.float32) * float(scale)
+                if prompt_box is not None
+                else None
+            )
+            prompt_trust = (
+                1.0
+                if manual_box is not None
+                else float(proposal.get("confidence", 0.7))
+                if proposal is not None
+                else 1.0
+            )
+
+            def evaluate_anchor(use_prompt_box: bool) -> dict | None:
+                processor.reset_all_prompts(state)
+                processor.set_text_prompt(label, state)
+                if use_prompt_box and prompt_box is not None:
+                    x0, y0, x1, y1 = prompt_box
+                    processor.add_geometric_prompt(
+                        box=[
+                            ((x0 + x1) / 2) / original.width,
+                            ((y0 + y1) / 2) / original.height,
+                            (x1 - x0) / original.width,
+                            (y1 - y0) / original.height,
+                        ],
+                        label=True,
+                        state=state,
+                    )
+                masks = np.asarray(state["masks"], dtype=bool)
+                if masks.ndim == 4 and masks.shape[1] == 1:
+                    masks = masks[:, 0]
+                if masks.ndim != 3:
+                    raise RuntimeError(
+                        f"Unexpected SAM 3 mask shape {masks.shape}; "
+                        "expected [detections, height, width]."
+                    )
+                boxes = np.asarray(state["boxes"], dtype=np.float32)
+                scores = np.asarray(state["scores"], dtype=np.float32)
+                if len(scores) == 0:
+                    return None
+                order = np.argsort(scores)[::-1]
+                masks, boxes, scores = masks[order], boxes[order], scores[order]
+                chosen, candidate_scores = select_object_candidate(
+                    image,
+                    masks,
+                    boxes,
+                    scores,
+                    exemplars.get(label),
+                    previous_box_by_label.get(label),
+                    prompt_box_for_image if use_prompt_box else None,
+                    prompt_trust,
                 )
-            masks = np.asarray(state["masks"], dtype=bool)
-            if masks.ndim == 4 and masks.shape[1] == 1:
-                masks = masks[:, 0]
-            if masks.ndim != 3:
-                raise RuntimeError(
-                    f"Unexpected SAM 3 mask shape {masks.shape}; "
-                    "expected [detections, height, width]."
+                rejection_reason = (
+                    prompt_anchor_rejection_reason(candidate_scores[chosen])
+                    if use_prompt_box and prompt_box is not None
+                    else None
                 )
-            boxes = np.asarray(state["boxes"], dtype=np.float32)
-            scores = np.asarray(state["scores"], dtype=np.float32)
-            if len(scores) == 0:
+                if rejection_reason is not None:
+                    return None
+                return {
+                    "mask": masks[chosen],
+                    "box": boxes[chosen].copy(),
+                    "score": float(scores[chosen]),
+                    "candidate_count": int(len(scores)),
+                    "selection_score": candidate_scores[chosen],
+                    "source": (
+                        "manual_seed"
+                        if use_prompt_box and manual_box is not None
+                        else (
+                            str(proposal.get("source", "box_proposal"))
+                            if use_prompt_box and proposal_box is not None
+                            else "none"
+                        )
+                    ),
+                }
+
+            text_anchor = evaluate_anchor(False)
+            prompted_anchor = (
+                evaluate_anchor(True) if prompt_box is not None else None
+            )
+            anchor = text_anchor
+            if prompted_anchor is not None:
+                if manual_box is not None:
+                    anchor = prompted_anchor
+                elif text_anchor is None:
+                    anchor = prompted_anchor
+                elif (
+                    prompt_box_for_image is not None
+                    and box_prompt_alignment(
+                        text_anchor["box"],
+                        prompt_box_for_image,
+                        image.size,
+                    )["box_prompt_agreement"]
+                    < 0.35
+                ):
+                    anchor = prompted_anchor
+                elif (
+                    text_anchor["score"] < 0.70
+                    and prompted_anchor["score"] >= text_anchor["score"] - 0.05
+                ):
+                    anchor = prompted_anchor
+                elif (
+                    prompted_anchor["selection_score"]["total"]
+                    > text_anchor["selection_score"]["total"] + 0.12
+                ):
+                    anchor = prompted_anchor
+
+            if anchor is None:
+                consecutive_misses[label] = consecutive_misses.get(label, 0) + 1
+                if consecutive_misses[label] >= 2:
+                    previous_box_by_label.pop(label, None)
                 frame_discoveries.append(
                     {
                         "frame_index": frame_index,
@@ -374,26 +738,32 @@ def main() -> None:
                     }
                 )
                 continue
-            order = np.argsort(scores)[::-1]
-            masks, boxes, scores = masks[order], boxes[order], scores[order]
-            chosen = select_with_exemplar(image, masks, exemplars.get(label))
-            mask = masks[chosen]
+            mask = anchor["mask"]
+            chosen_box = anchor["box"]
+            previous_box_by_label[label] = chosen_box / np.asarray(
+                [image.width, image.height, image.width, image.height],
+                dtype=np.float32,
+            )
+            consecutive_misses[label] = 0
             if scale != 1.0:
                 mask = np.asarray(
                     Image.fromarray(mask.astype(np.uint8) * 255).resize(
                         original.size, Image.Resampling.NEAREST
                     )
                 ) > 0
-                boxes[chosen] /= scale
+                chosen_box /= scale
             frame_discoveries.append(
                 {
                     "frame_index": frame_index,
                     "object_id": object_id,
                     "label": label,
                     "found": True,
-                    "score": float(scores[chosen]),
-                    "box_xyxy": [float(x) for x in boxes[chosen].tolist()],
+                    "score": anchor["score"],
+                    "box_xyxy": [float(x) for x in chosen_box.tolist()],
                     "mask_rle": encode_coco_rle(mask),
+                    "candidate_count": anchor["candidate_count"],
+                    "selection_score": anchor["selection_score"],
+                    "box_prompt_source": anchor["source"],
                 }
             )
         del state

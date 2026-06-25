@@ -15,8 +15,8 @@ from .pipeline import process as run_pipeline
 from .runtime import conda_executable, project_root
 
 app = typer.Typer(no_args_is_help=True)
-models_app = typer.Typer(no_args_is_help=True)
-app.add_typer(models_app, name="models")
+models_app = typer.Typer(no_args_is_help=True, hidden=True)
+app.add_typer(models_app, name="models", hidden=True)
 console = Console()
 
 
@@ -55,6 +55,25 @@ def _checkpoint_status(root: Path) -> dict:
             ),
         }
 
+    qwen_box_progress = work / "qwen_box_progress"
+    if qwen_box_progress.exists():
+        metadata_path = qwen_box_progress / "metadata.json"
+        metadata = (
+            json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+        )
+        partial["boxes"] = {
+            "completed_keyframes": len(
+                [
+                    path
+                    for path in qwen_box_progress.glob("*.json")
+                    if path.name != "metadata.json"
+                ]
+            ),
+            "total_keyframes": len(
+                metadata.get("signature", {}).get("keyframes", [])
+            ),
+        }
+
     sam3_progress = work / "sam3_progress"
     if sam3_progress.exists():
         metadata_path = sam3_progress / "metadata.json"
@@ -74,21 +93,12 @@ def _checkpoint_status(root: Path) -> dict:
             ),
         }
 
-    sam2_progress = work / "sam2_checkpoints"
-    if sam2_progress.exists():
-        metadata_path = sam2_progress / "metadata.json"
-        metadata = (
-            json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-        )
-        signature = metadata.get("signature", {})
-        total = (
-            len(signature.get("ranges", []))
-            * len(signature.get("objects", {}))
-            * 2
-        )
-        partial["sam2"] = {
-            "completed_object_chunks": len(list(sam2_progress.glob("*.npz"))),
-            "total_object_chunks": total,
+    cutie_progress = work / "cutie_segments"
+    if cutie_progress.exists():
+        partial["cutie"] = {
+            "completed_anchor_intervals": len(
+                list(cutie_progress.glob("*.npz"))
+            )
         }
 
     depth_progress = work / "depth_progress.json"
@@ -166,7 +176,7 @@ def process(
     objects: str = typer.Option(
         "",
         help=(
-            "Comma-separated object names for SAM 3 localization and SAM 2 tracking."
+            "Comma-separated object names for SAM 3 localization and Cutie tracking."
         ),
     ),
     prompt_bank: Path | None = typer.Option(
@@ -202,6 +212,11 @@ def process(
         "--sam3-stride",
         min=1,
         help="Run SAM 3 verification/localization every N source frames.",
+    ),
+    box_proposer: str = typer.Option(
+        "qwen",
+        "--box-proposer",
+        help="Box proposer before SAM 3: qwen or none.",
     ),
     output: Path = typer.Option(..., "-o", "--output"),
     exemplar: list[str] = typer.Option([], help="Repeat OBJECT=/path/image.jpg."),
@@ -239,7 +254,9 @@ def process(
             "Use exactly one object vocabulary source: --objects, --prompt-bank, "
             "or --discover-objects."
         )
-    missing = verify_models(include_qwen=discover_objects)
+    if box_proposer not in {"qwen", "none"}:
+        raise typer.BadParameter("--box-proposer must be qwen or none")
+    missing = verify_models(include_qwen=discover_objects or box_proposer == "qwen")
     if missing:
         console.print("[red]Missing required model assets:[/red]")
         for item in missing:
@@ -257,6 +274,7 @@ def process(
         qwen_max_candidates=qwen_max_candidates,
         qwen_stride=qwen_stride,
         sam3_stride=sam3_stride,
+        box_proposer=box_proposer,
         exemplars=_parse_exemplars(exemplar),
         depth_every=depth_every,
         depth_input_size=depth_input_size,
@@ -272,15 +290,15 @@ def doctor() -> None:
     report = {
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "models": {
-            "ok": not verify_models(),
-            "problems": verify_models(),
+            "ok": not verify_models(include_qwen=True),
+            "problems": verify_models(include_qwen=True),
         },
         "core": _environment_check(
             "gradyn-core", "import gradyn; print(gradyn.__version__)"
         ),
         "objects": _environment_check(
             "gradyn-objects",
-            "import torch, mlx.core as mx, sam2, sam3; "
+            "import torch, mlx.core as mx, sam3; "
             "print({'mps': torch.backends.mps.is_available(), "
             "'metal': mx.metal.is_available()})",
         ),
@@ -291,9 +309,9 @@ def doctor() -> None:
         ),
         "inference": _environment_check(
             "gradyn-inference",
-            "import torch, cv2; "
+            "import torch, cv2, cutie; "
             "print({'mps': torch.backends.mps.is_available(), "
-            "'opencv': cv2.__version__})",
+            "'opencv': cv2.__version__, 'cutie': True})",
         ),
     }
     console.print_json(json.dumps(report))
@@ -394,7 +412,7 @@ def seed_object(
         help="Source-pixel box as x1,y1,x2,y2.",
     ),
 ) -> None:
-    """Add one visual object box used to initialize SAM 3 and SAM 2."""
+    """Add one visual object box used to initialize SAM 3 and Cutie."""
     root = output.expanduser().resolve()
     metadata = json.loads((root / "source" / "video_metadata.json").read_text())
     if frame >= int(metadata["frame_count"]):
@@ -453,11 +471,11 @@ def seed_object(
     console.print("Run `gradyn rebuild-objects RESULT` to apply it.")
 
 
-@app.command("rebuild-objects")
+@app.command("rebuild-objects", hidden=True)
 def rebuild_objects(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
 ) -> None:
-    """Rebuild SAM 3/SAM 2 objects while preserving preprocessing, hands, and depth."""
+    """Rebuild SAM 3/Cutie objects while preserving preprocessing, hands, and depth."""
     from .exports import build_exports
     from .quality import build_quality_report
     from .runtime import mark_stage, run_worker
@@ -498,6 +516,27 @@ def rebuild_objects(
         )
     if prompt_bank:
         sam3_args.extend(["--prompt-bank", str(prompt_bank)])
+    if config.get("box_proposer", "qwen") == "qwen":
+        box_args = [
+            *common,
+            "--objects-json",
+            json.dumps(object_names),
+            "--stride",
+            str(config.get("sam3_stride", 90)),
+            "--max-side",
+            str(config.get("qwen_box_max_side", 672)),
+            "--max-tokens",
+            str(config.get("qwen_box_max_tokens", 384)),
+        ]
+        candidate_path = root / ".work" / "approved_candidate_prompts.json"
+        if candidate_path.exists():
+            box_args.extend(["--candidate-prompts-json", str(candidate_path)])
+        if prompt_bank:
+            box_args.extend(["--prompt-bank", str(prompt_bank)])
+        run_worker("gradyn-vocab", "qwen_boxes.py", box_args)
+        sam3_args.extend(
+            ["--box-proposals-json", str(root / ".work" / "qwen_box_proposals.json")]
+        )
     manual_seeds = root / "objects" / "manual_seeds.json"
     if manual_seeds.exists():
         sam3_args.extend(["--manual-seeds-json", str(manual_seeds)])
@@ -505,17 +544,11 @@ def rebuild_objects(
     run_worker("gradyn-objects", "sam3_discover.py", sam3_args)
     mark_stage(root / ".work", "sam3", config_hash)
     run_worker(
-        "gradyn-objects",
-        "sam2_track.py",
-        [
-            *common,
-            "--chunk-frames",
-            str(config.get("sam2_chunk_frames", 180)),
-            "--overlap",
-            str(config.get("sam2_overlap_frames", 16)),
-        ],
+        "gradyn-inference",
+        "cutie_track.py",
+        ["--job", str(root)],
     )
-    mark_stage(root / ".work", "sam2", config_hash)
+    mark_stage(root / ".work", "cutie", config_hash)
     build_quality_report(root)
     build_exports(root)
     console.print(
@@ -523,11 +556,16 @@ def rebuild_objects(
     )
 
 
-@app.command("rebuild-tracks")
+@app.command("rebuild-tracks", hidden=True)
 def rebuild_tracks(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
+    device: str = typer.Option(
+        "auto",
+        "--device",
+        help="Cutie device for rebuilding object tracks: auto, mps, or cpu.",
+    ),
 ) -> None:
-    """Rebuild only SAM 2 tracks from the existing SAM 3 discoveries."""
+    """Rebuild only Cutie tracks from the existing SAM 3 discoveries."""
     from .exports import build_exports
     from .quality import build_quality_report
     from .runtime import mark_stage, run_worker
@@ -538,22 +576,17 @@ def rebuild_tracks(
         raise typer.BadParameter(
             "Existing SAM 3 discoveries are missing; use `gradyn rebuild-objects`."
         )
+    if device not in {"auto", "mps", "cpu"}:
+        raise typer.BadParameter("--device must be auto, mps, or cpu")
     manifest = json.loads((root / "manifest.json").read_text())
     config = manifest["config"]
     config_hash = str(manifest["config_hash"])
     run_worker(
-        "gradyn-objects",
-        "sam2_track.py",
-        [
-            "--job",
-            str(root),
-            "--chunk-frames",
-            str(config.get("sam2_chunk_frames", 180)),
-            "--overlap",
-            str(config.get("sam2_overlap_frames", 16)),
-        ],
+        "gradyn-inference",
+        "cutie_track.py",
+        ["--job", str(root), "--device", device],
     )
-    mark_stage(root / ".work", "sam2", config_hash)
+    mark_stage(root / ".work", "cutie", config_hash)
     build_quality_report(root)
     build_exports(root)
     console.print(
@@ -561,7 +594,7 @@ def rebuild_tracks(
     )
 
 
-@app.command("add-depth")
+@app.command("add-depth", hidden=True)
 def add_depth(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
     every: int = typer.Option(
@@ -603,7 +636,7 @@ def add_depth(
     console.print(f"[bold green]Depth complete:[/bold green] {root / 'depth'}")
 
 
-@app.command("rebuild-hands")
+@app.command("rebuild-hands", hidden=True)
 def rebuild_hands(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
     device: str = typer.Option(
@@ -636,7 +669,7 @@ def rebuild_hands(
     )
 
 
-@app.command("calibrate-camera")
+@app.command("calibrate-camera", hidden=True)
 def calibrate_camera(
     video: Path = typer.Argument(..., exists=True, dir_okay=False),
     square_size_mm: float = typer.Option(
@@ -674,17 +707,7 @@ def calibrate_camera(
 @models_app.command("setup")
 def models_setup() -> None:
     setup_repositories()
-
-
-@models_app.command("download")
-def models_download(
-    with_qwen: bool = typer.Option(
-        False,
-        "--with-qwen",
-        help="Also download the optional Qwen3-VL discovery checkpoint.",
-    ),
-) -> None:
-    download_public_weights(include_qwen=with_qwen)
+    download_public_weights(include_qwen=True)
 
 
 @models_app.command("install-mano")
@@ -696,14 +719,8 @@ def models_install_mano(
 
 
 @models_app.command("verify")
-def models_verify(
-    with_qwen: bool = typer.Option(
-        False,
-        "--with-qwen",
-        help="Require the optional Qwen3-VL discovery checkpoint.",
-    ),
-) -> None:
-    missing = verify_models(include_qwen=with_qwen)
+def models_verify() -> None:
+    missing = verify_models(include_qwen=True)
     if missing:
         console.print(json.dumps({"ready": False, "missing": missing}, indent=2))
         raise typer.Exit(1)

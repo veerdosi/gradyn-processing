@@ -33,8 +33,14 @@ One row per requested object per frame:
 - `label`: requested canonical object name
 - `bbox_x`, `bbox_y`, `bbox_width`, `bbox_height`: source-resolution pixels
 - `mask_area_px`
-- `visibility`: `visible`, `partially_occluded`, `fully_occluded`, or `uncertain`
+- `visibility`: `visible`, `partially_occluded`, `fully_occluded`, `out_of_frame`,
+  or `rejected`
 - `confidence`: `[0, 1]`
+- `source`: `sam3_anchor`, `cutie_bidirectional`, `cutie_forward_tail`,
+  `cutie_incoherent`, `unverified_anchor_gap`, or `untracked`
+- `directional_iou`: forward/backward mask agreement for bounded Cutie intervals
+- `primary_component_fraction`: fraction of the fused prediction retained as the
+  coherent physical object
 
 ### `objects/masks.json`
 

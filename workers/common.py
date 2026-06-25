@@ -88,19 +88,22 @@ def mask_bbox(mask: np.ndarray) -> list[int]:
 
 
 def encode_coco_rle(mask: np.ndarray) -> dict:
-    pixels = np.asarray(mask, dtype=np.uint8).T.flatten()
-    counts: list[int] = []
-    previous = 0
-    run = 0
-    for pixel in pixels:
-        value = int(pixel)
-        if value == previous:
-            run += 1
-        else:
-            counts.append(run)
-            run = 1
-            previous = value
-    counts.append(run)
+    pixels = np.asarray(mask, dtype=np.uint8).ravel(order="F")
+    if pixels.size == 0:
+        counts = [0]
+    else:
+        changes = np.flatnonzero(pixels[1:] != pixels[:-1]) + 1
+        boundaries = np.concatenate(
+            (
+                np.asarray([0], dtype=np.int64),
+                changes,
+                np.asarray([pixels.size], dtype=np.int64),
+            )
+        )
+        counts = np.diff(boundaries).astype(int).tolist()
+        # COCO RLE always begins with the background (zero) run.
+        if int(pixels[0]) == 1:
+            counts.insert(0, 0)
     return {"size": [int(mask.shape[0]), int(mask.shape[1])], "counts": counts}
 
 
@@ -245,12 +248,51 @@ def overlay_mask(
     solid = Image.new("RGBA", image.size, (*color, 0))
     solid.putalpha(alpha)
     base.alpha_composite(solid)
+
+    # Draw the actual mask boundary independently of the axis-aligned box.
+    # A box encloses occluded holes and empty corners, so using it as the only
+    # outline makes a correct non-rectangular mask look spatially misaligned.
+    boolean_mask = np.asarray(mask, dtype=bool)
+    interior = boolean_mask.copy()
+    interior[1:, :] &= boolean_mask[:-1, :]
+    interior[:-1, :] &= boolean_mask[1:, :]
+    interior[:, 1:] &= boolean_mask[:, :-1]
+    interior[:, :-1] &= boolean_mask[:, 1:]
+    boundary = boolean_mask & ~interior
+    contour_alpha = Image.fromarray(
+        boundary.astype(np.uint8) * 255, mode="L"
+    )
+    contour = Image.new("RGBA", image.size, (*color, 0))
+    contour.putalpha(contour_alpha)
+    base.alpha_composite(contour)
+
     draw = ImageDraw.Draw(base)
     if bbox:
-        x, y, w, h = bbox
-        draw.rectangle((x, y, x + w, y + h), outline=(*color, 255), width=3)
-        draw.rectangle((x, max(0, y - 20), x + max(70, len(label) * 8), y), fill=(*color, 220))
-        draw.text((x + 3, max(0, y - 18)), label, fill=(0, 0, 0, 255))
+        x, y, w, h = [int(value) for value in bbox]
+        x = max(0, min(image.width - 1, x))
+        y = max(0, min(image.height - 1, y))
+        w = max(1, min(image.width - x, w))
+        h = max(1, min(image.height - y, h))
+        # Bounding boxes use [x, y, width, height], so the final included pixel
+        # is x + width - 1 / y + height - 1.
+        draw.rectangle(
+            (x, y, x + w - 1, y + h - 1),
+            outline=(*color, 255),
+            width=2,
+        )
+        if image.height >= 40 and image.width >= 80:
+            label_top = max(0, y - 20)
+            label_bottom = max(label_top + 1, y)
+            label_right = min(image.width - 1, x + max(70, len(label) * 8))
+            draw.rectangle(
+                (x, label_top, label_right, label_bottom),
+                fill=(*color, 220),
+            )
+            draw.text(
+                (x + 3, label_top + 2),
+                label,
+                fill=(0, 0, 0, 255),
+            )
     return base.convert("RGB")
 
 

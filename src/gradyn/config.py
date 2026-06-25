@@ -20,8 +20,9 @@ class ProcessConfig(BaseModel):
     exemplars: dict[str, Path] = Field(default_factory=dict)
     qwen_stride: int = 360
     sam3_stride: int = 90
-    sam2_chunk_frames: int = 180
-    sam2_overlap_frames: int = 16
+    box_proposer: str = "qwen"
+    qwen_box_max_side: int = 672
+    qwen_box_max_tokens: int = 384
     max_inference_side: int = 960
     depth_backend: str = "depth_anything_v2_small_relative"
     depth_input_size: int = 756

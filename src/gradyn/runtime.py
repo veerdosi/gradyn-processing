@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 from functools import lru_cache
@@ -89,7 +90,18 @@ def run_worker(env: str, worker: str, args: list[str]) -> None:
             process.wait()
         raise
     if return_code:
-        raise StageError(f"{worker} failed in Conda environment {env}")
+        if return_code < 0:
+            signum = -return_code
+            try:
+                signal_name = signal.Signals(signum).name
+            except ValueError:
+                signal_name = f"signal {signum}"
+            raise StageError(
+                f"{worker} was terminated by {signal_name} in Conda environment {env}"
+            )
+        raise StageError(
+            f"{worker} failed with exit code {return_code} in Conda environment {env}"
+        )
 
 
 def stage_done(work: Path, name: str, config_hash: str) -> bool:

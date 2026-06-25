@@ -239,7 +239,7 @@ def main() -> None:
     model_path = root / MODEL_PATH
     if not (model_path / "config.json").exists():
         raise SystemExit(
-            "Qwen3-VL weights are missing. Run `gradyn models download`."
+            "Qwen3-VL weights are missing. Run `gradyn models setup`."
         )
 
     paths = job_paths(args.job)

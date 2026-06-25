@@ -36,6 +36,17 @@ def reusable_preprocessing(config: ProcessConfig, paths: JobPaths) -> bool:
     return expected > 0 and len(list(paths.frames.glob("*.jpg"))) == expected
 
 
+def qwen_box_stage_done(paths: JobPaths, config_hash: str) -> bool:
+    proposals = paths.work / "qwen_box_proposals.json"
+    if not stage_done(paths.work, "boxes", config_hash) or not proposals.exists():
+        return False
+    try:
+        payload = json.loads(proposals.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("box_coordinate_system") == "qwen_0_1000"
+
+
 def process(config: ProcessConfig, *, skip_depth: bool = False) -> None:
     started = time.monotonic()
     console.print(
@@ -115,7 +126,7 @@ def process(config: ProcessConfig, *, skip_depth: bool = False) -> None:
             console.rule("[bold yellow]Object vocabulary approval required")
             console.print(
                 "Qwen proposed these physical objects. Approve only the names "
-                "you want SAM 3 to verify and SAM 2 to track:"
+                "you want SAM 3 to verify and Cutie to track:"
             )
             for item in discovery.get("candidates", []):
                 console.print(
@@ -180,7 +191,40 @@ def process(config: ProcessConfig, *, skip_depth: bool = False) -> None:
             + ", ".join(approved_labels)
         )
 
-    if not config.resume or not stage_done(paths.work, "sam3", config_hash):
+    boxes_updated = False
+    if config.box_proposer == "qwen":
+        boxes_done = qwen_box_stage_done(paths, config_hash)
+        if not config.resume or not boxes_done:
+            console.rule("[bold]1.75/6 Proposing object boxes with Qwen3-VL")
+            box_args = [
+                *common,
+                "--objects-json",
+                json.dumps(config.objects),
+                "--stride",
+                str(config.sam3_stride),
+                "--max-side",
+                str(config.qwen_box_max_side),
+                "--max-tokens",
+                str(config.qwen_box_max_tokens),
+            ]
+            if qwen_mode:
+                box_args.extend(
+                    [
+                        "--candidate-prompts-json",
+                        str(paths.work / "approved_candidate_prompts.json"),
+                    ]
+                )
+            if config.prompt_bank:
+                box_args.extend(["--prompt-bank", str(config.prompt_bank)])
+            run_worker("gradyn-vocab", "qwen_boxes.py", box_args)
+            mark_stage(paths.work, "boxes", config_hash)
+            boxes_updated = True
+            console.print("[green]✓ Qwen box proposals complete[/green]")
+        else:
+            console.print("[dim]↷ Reusing completed Qwen box proposals[/dim]")
+
+    sam3_updated = False
+    if boxes_updated or not config.resume or not stage_done(paths.work, "sam3", config_hash):
         console.rule("[bold]2/6 Discovering objects with MLX SAM 3")
         args = [
             *common,
@@ -209,29 +253,27 @@ def process(config: ProcessConfig, *, skip_depth: bool = False) -> None:
         manual_seeds = paths.objects / "manual_seeds.json"
         if manual_seeds.exists():
             args.extend(["--manual-seeds-json", str(manual_seeds)])
+        box_proposals = paths.work / "qwen_box_proposals.json"
+        if config.box_proposer == "qwen" and box_proposals.exists():
+            args.extend(["--box-proposals-json", str(box_proposals)])
         run_worker("gradyn-objects", "sam3_discover.py", args)
         mark_stage(paths.work, "sam3", config_hash)
+        sam3_updated = True
         console.print("[green]✓ Object discovery complete[/green]")
     else:
         console.print("[dim]↷ Reusing completed SAM 3 discovery[/dim]")
 
-    if not config.resume or not stage_done(paths.work, "sam2", config_hash):
-        console.rule("[bold]3/6 Tracking objects with SAM 2")
+    if sam3_updated or not config.resume or not stage_done(paths.work, "cutie", config_hash):
+        console.rule("[bold]3/6 Tracking objects with Cutie")
         run_worker(
-            "gradyn-objects",
-            "sam2_track.py",
-            [
-                *common,
-                "--chunk-frames",
-                str(config.sam2_chunk_frames),
-                "--overlap",
-                str(config.sam2_overlap_frames),
-            ],
+            "gradyn-inference",
+            "cutie_track.py",
+            ["--job", str(paths.root)],
         )
-        mark_stage(paths.work, "sam2", config_hash)
+        mark_stage(paths.work, "cutie", config_hash)
         console.print("[green]✓ Object tracking complete[/green]")
     else:
-        console.print("[dim]↷ Reusing completed SAM 2 tracking[/dim]")
+        console.print("[dim]↷ Reusing completed Cutie tracking[/dim]")
 
     if skip_depth:
         console.print(

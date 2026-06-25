@@ -49,12 +49,12 @@ done
 
 "$CONDA_BIN" run -n gradyn-core python -m pip install -e "$ROOT"
 "$CONDA_BIN" run -n gradyn-core python "$ROOT/scripts/patch_wilor.py"
+"$CONDA_BIN" run -n gradyn-core python "$ROOT/scripts/patch_cutie.py"
 "$CONDA_BIN" run -n gradyn-vocab python -m pip install \
   "numpy>=2,<2.3" "opencv-python==4.12.0.88" \
   "torch==2.5.1" "torchvision==0.20.1" \
   "transformers==4.57.3" "mlx-lm==0.29.1" "mlx-vlm==0.3.4"
 "$CONDA_BIN" run -n gradyn-objects python -m pip install -e "$ROOT/models/mlx-sam3"
-"$CONDA_BIN" run -n gradyn-objects env SAM2_BUILD_CUDA=0 python -m pip install -e "$ROOT/models/sam2"
 "$CONDA_BIN" run -n gradyn-objects python -m pip install pyarrow scipy
 "$CONDA_BIN" run -n gradyn-inference python -m pip install \
   "numpy==1.26.4" "torch==2.5.1" "torchvision==0.20.1" \
@@ -62,6 +62,8 @@ done
   torchmetrics==1.4.0 smplx==0.1.28 yacs timm einops hydra-core \
   hydra-submitit-launcher hydra-colorlog pyrootutils rich \
   ultralytics==8.1.34 "opencv-python==4.10.0.84" natsort joblib dill
+"$CONDA_BIN" run -n gradyn-inference python -m pip install \
+  -e "$ROOT/models/Cutie" --no-deps
 "$CONDA_BIN" run -n gradyn-inference python -m pip install \
   --no-build-isolation chumpy
 "$CONDA_BIN" run -n gradyn-inference python -m pip uninstall -y \

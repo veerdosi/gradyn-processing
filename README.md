@@ -33,7 +33,7 @@ cd gradyn-processing
 
 The setup command:
 
-- clones pinned versions of MLX SAM 3 Image, SAM 2.1, WiLoR, and Depth Anything V2;
+- clones pinned versions of MLX SAM 3 Image, Cutie, WiLoR, and Depth Anything V2;
 - creates four isolated Conda environments;
 - installs each upstream project in its compatible environment;
 - downloads and validates all weights needed by the normal explicit-object pipeline;
@@ -53,12 +53,8 @@ instead:
 ./setup.sh --mano-dir /path/to/mano_v1_2/models
 ```
 
-Qwen is optional and not downloaded for production runs with explicit object names. Install
-it only when automatic vocabulary discovery is needed:
-
-```bash
-./setup.sh --with-qwen
-```
+Qwen is installed by default because Gradyn uses it for semantic keyframe box proposals
+before SAM 3, even when object names are supplied explicitly.
 
 Gradyn uses `curl` with visible progress, retries, resumable partial files, and exact
 SAM 3 file-size validation.
@@ -107,9 +103,16 @@ jobs, approval can be supplied separately:
 ./gradyn process video.mp4 --camera "Camera make/model" --discover-objects --output result
 ```
 
-The approval is stored in `objects/approved_prompts.json`. SAM 3 then verifies and
-localizes only those approved names every 90 frames. SAM 2 tracks only the classes SAM 3
-can repeatedly localize.
+The approval is stored in `objects/approved_prompts.json`. For each approved or explicit
+object name, Qwen3-VL first proposes a tight semantic box on the same keyframes. SAM 3
+then uses those boxes as geometric prompts and refines them into masks. If Qwen is
+uncertain or returns no valid box for a frame, SAM 3 falls back to text prompting for
+that frame. Cutie propagates each positive SAM 3 mask as a persistent physical-object
+track.
+
+The normal product workflow only requires `process`; rerunning the same command resumes
+from checkpoints. The commands below are hidden maintenance tools for development and
+targeted recovery, not commands an operator needs to learn.
 
 To reduce or change the tracked object set after a completed run without rebuilding
 hands or depth:
@@ -119,8 +122,21 @@ hands or depth:
 ./gradyn rebuild-objects result
 ```
 
-Small manipulated tools may be too small or visually ambiguous for text-only SAM 3.
-Initialize such an object once with a tight source-pixel box; SAM 2 then tracks it:
+Qwen box proposals are enabled by default because text-only SAM 3 can confuse visually
+similar task objects, such as a hammer handle versus a metal rod or a background sheet
+versus the manipulated sheet. To disable the box proposer for debugging:
+
+```bash
+./gradyn process /path/video.mp4 \
+  --camera "Camera make/model" \
+  --objects "metal sheet,hammer" \
+  --box-proposer none \
+  --output /path/result
+```
+
+Small manipulated tools may still be too small or visually ambiguous for text and
+open-vocabulary boxes. Initialize such an object once with a tight source-pixel box; SAM 3
+uses that box as the strongest prompt and Cutie then tracks it:
 
 ```bash
 ./gradyn seed-object result \
@@ -134,13 +150,34 @@ Initialize such an object once with a tight source-pixel box; SAM 2 then tracks 
 The box is stored in `objects/manual_seeds.json` as provenance. This is a one-time
 initialization, not frame-by-frame annotation.
 
-SAM 2 also consumes SAM 3's negative observations. When SAM 3 misses an approved object
-on at least two consecutive keyframes, Gradyn marks the midpoint-bounded span as confirmed
-absence. SAM 2 exports an absent/occluded state there instead of drifting the object's
-identity onto a nearby hand or arm, then reacquires it at the next positive anchor.
+SAM 3 detections are positive localization anchors only. A SAM 3 miss is never treated as
+evidence that the physical object disappeared.
 
-After tracker/validation logic changes, reuse existing SAM 3 detections without rerunning
-SAM 3:
+Cutie tracks each physical object between positive SAM 3 mask anchors. Every bounded
+interval is propagated in both directions: forward from the left anchor and backward from
+the right anchor. The two masks are fused, disconnected false regions are removed, and the
+bounding box is recomputed from that final source-resolution mask. This recovers object
+regions lost in one direction while preventing unrelated machine fragments from expanding
+the delivered box.
+
+Each direction of each object/anchor interval is saved as an atomic checkpoint. An
+interrupted job therefore restarts only the unfinished direction. Changing an anchor
+invalidates only the adjacent directional checkpoints that depend on it. After the final
+anchor, Cutie uses cleaned forward propagation because no future anchor is available.
+
+SAM 3 is used for semantic localization; Cutie is used for temporal mask propagation.
+SAM 3 misses never create absence spans. Frames before the first positive anchor are
+`out_of_frame`; a directionally incoherent or missing propagated result is rejected rather
+than fabricated. Directional IoU and retained-primary-component fraction are exported for
+QA.
+
+Cutie does not run unbounded sparse-anchor gaps. If an uncached anchor interval is longer
+than the configured safe cap, Gradyn skips that propagation and marks the unsupported span
+as low-confidence rather than risking MPS out-of-memory or inventing a long track. In
+practice, this means ambiguous objects should be renamed, visually seeded, or excluded
+instead of forced through the tracker.
+
+To reuse existing SAM 3 detections and rebuild only Cutie tracks:
 
 ```bash
 ./gradyn rebuild-tracks result
@@ -195,7 +232,7 @@ checkpoint granularity is:
 
 - Qwen3-VL: every inspected frame
 - MLX SAM 3: every inspected keyframe
-- SAM 2: every object, direction, and video chunk
+- Cutie: every object and SAM 3 anchor interval
 - Depth Anything V2: every processed depth frame
 - WiLoR: every 10 source frames
 
@@ -324,44 +361,46 @@ consumer specifically requires TensorFlow serialization.
 
 Large models run in separate processes and Conda environments in this order:
 
-`[optional Qwen3-VL → approval] → MLX SAM 3 → SAM 2.1 small → Depth Anything V2 Small → WiLoR CPU`
+`[optional Qwen3-VL vocabulary → approval] → Qwen3-VL boxes → MLX SAM 3 → Cutie → Depth Anything V2 Small → WiLoR CPU`
 
-Qwen3-VL is opt-in through `--discover-objects`. It uses a 4-bit MLX checkpoint, processes
-one resized image at a time, checkpoints each response, and is unloaded before SAM 3
-starts. Normal explicit-object and prompt-bank runs skip Qwen entirely.
+Qwen3-VL vocabulary discovery is opt-in through `--discover-objects`. Qwen3-VL box
+grounding is enabled by default for explicit-object and prompt-bank runs. It uses a 4-bit
+MLX checkpoint, processes one resized image at a time, checkpoints each response, and is
+unloaded before SAM 3 starts.
 
 On the target 8 GB M2, the three-frame production smoke test used 2.88 GB active MLX
 memory, peaked at 3.82 GB in MLX and approximately 5.3 GB process footprint, completed in
 25.6 seconds, and used no swap. At the every-360-frame default, the 3,608-frame sample
 requires 12 Qwen frames including the first and final frames.
 
-Only one model family is resident at a time. SAM 2 offloads video frames and state to CPU,
-processes overlapping chunks, and WiLoR processes frames sequentially on CPU for numerical
-correctness. MPS cache cleanup occurs between accelerated stages. Unsupported
-MPS operations use PyTorch's explicitly enabled CPU fallback and are recorded in terminal logs.
+Only one model family is resident at a time. Cutie processes one object and one SAM 3
+anchor interval at a time, and WiLoR processes frames sequentially on CPU for numerical
+correctness. MPS cache cleanup occurs between accelerated stages. Unsupported MPS
+operations use PyTorch's explicitly enabled CPU fallback and are recorded in terminal logs.
 
 Current device placement:
 
 - FFmpeg preprocessing, validation, encoding, optical flow, filtering, and exports: CPU
-- Qwen3-VL, when explicitly enabled: MLX/Metal
+- Qwen3-VL vocabulary and box proposals: MLX/Metal
 - SAM 3 Image: MLX/Metal
-- SAM 2.1 Small inference: PyTorch MPS, with frames and tracker state offloaded to CPU
+- Cutie object tracking: PyTorch MPS when supported, with an explicit CPU mode available
 - Depth Anything V2 Small inference: PyTorch MPS, with isolated CPU fallback and CPU postprocessing
 - WiLoR hand detector: CPU
 - WiLoR reconstruction: CPU by default because the current MPS path fails numerical geometry checks
 
 The 8 GB M2 is the supported local quality-validation machine, not a practical single-machine
 production fleet for hundreds of hour-long videos. Explicit object names remove Qwen cost but
-do not remove the dominant full-frame depth, bidirectional SAM 2, and CPU WiLoR costs.
+do not remove the dominant full-frame depth, object tracking, and CPU WiLoR costs.
 Quality-preserving production scaling should run independent videos in parallel and use
-CUDA-backed workers for SAM 2, depth, and WiLoR after CUDA/MPS numerical parity tests. Local
+CUDA-backed workers for Cutie, depth, and WiLoR after CUDA/MPS numerical parity tests. Local
 speed knobs such as a larger SAM 3 stride, `--depth-every 2`, lower depth input size, or
 temporally subsampled hand reconstruction reduce compute by reducing validation frequency,
 temporal density, or spatial detail and therefore require dataset-specific acceptance tests.
 
-SAM 2 uses the official 2.1 small checkpoint at 512×512 and tracks one object per state.
-This avoids Apple's native multi-object mixed-dtype matrix-multiplication crash while keeping
-the stage GPU accelerated and practical on an 8 GB machine.
+Cutie uses the official `cutie-base-mega` checkpoint at a 480 px internal short-side
+resolution and tracks one object per state. Positive SAM 3 masks reset its object memory
+at each anchor interval, which prevents semantic fragments and repeated background
+instances from silently becoming the tracked identity.
 
 Depth Anything V2 Small runs one frame at a time on MPS at 756 px by default. Gradyn
 normalizes each prediction to relative inverse depth, applies edge-preserving filtering,

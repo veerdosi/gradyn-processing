@@ -2,7 +2,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WITH_QWEN=0
 MANO_DIR="${GRADYN_MANO_DIR:-}"
 MANO_DOWNLOAD_DIR="$ROOT/licensed_models/mano_v1_2/models"
 MANO_LEFT_ID="1scfcvug_hc_VvYl-vKHouic8Xd9lgUXE"
@@ -12,14 +11,13 @@ MANO_RIGHT_SHA256="45d60aa3b27ef9107a7afd4e00808f307fd91111e1cfa35afd5c4a62de264
 
 usage() {
   cat <<'EOF'
-Usage: ./setup.sh [--with-qwen] [--mano-dir /path/to/models]
+Usage: ./setup.sh [--mano-dir /path/to/models]
 
 Creates all Conda environments, installs Gradyn, clones pinned upstream
 repositories, downloads required model files including MANO, and verifies the
 installation.
 
 Options:
-  --with-qwen       Download the optional Qwen3-VL object-discovery model.
   --mano-dir PATH   Use an existing licensed MANO directory instead of the
                     configured Gradyn download.
 EOF
@@ -27,10 +25,6 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --with-qwen)
-      WITH_QWEN=1
-      shift
-      ;;
     --mano-dir)
       MANO_DIR="${2:-}"
       shift 2
@@ -104,15 +98,9 @@ else
   "$CONDA_BIN" env create -f "$ROOT/environment/core.yml"
 fi
 "$CONDA_BIN" run -n gradyn-core python -m pip install -e "$ROOT"
-"$CONDA_BIN" run -n gradyn-core gradyn models setup
-
 "$ROOT/scripts/setup_conda.sh"
 
-download_args=()
-if [[ "$WITH_QWEN" -eq 1 ]]; then
-  download_args+=(--with-qwen)
-fi
-"$CONDA_BIN" run -n gradyn-core gradyn models download "${download_args[@]}"
+"$CONDA_BIN" run -n gradyn-core gradyn models setup
 
 if [[ -z "$MANO_DIR" ]]; then
   for candidate in \
@@ -162,11 +150,7 @@ fi
   --right "$MANO_DIR/MANO_RIGHT.pkl" \
   --left "$MANO_DIR/MANO_LEFT.pkl"
 
-verify_args=()
-if [[ "$WITH_QWEN" -eq 1 ]]; then
-  verify_args+=(--with-qwen)
-fi
-"$CONDA_BIN" run -n gradyn-core gradyn models verify "${verify_args[@]}"
+"$CONDA_BIN" run -n gradyn-core gradyn models verify
 "$CONDA_BIN" run -n gradyn-core python -m pytest -q "$ROOT/tests"
 
 echo

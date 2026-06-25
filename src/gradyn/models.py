@@ -16,7 +16,10 @@ console = Console()
 
 REPOSITORIES = {
     "mlx-sam3": ("https://github.com/Deekshith-Dade/mlx_sam3.git", "d9a92badb6000a93135e01b89cd81a54e7ff9825"),
-    "sam2": ("https://github.com/facebookresearch/sam2.git", "2b90b9f5ceec907a1c18123530e92e794ad901a4"),
+    "Cutie": (
+        "https://github.com/hkchengrex/Cutie.git",
+        "ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a",
+    ),
     "WiLoR": ("https://github.com/rolpotamias/WiLoR.git", "fcb911312a38fa8badd30d9656a167485d61b8f9"),
     "depth-anything-v2": (
         "https://github.com/DepthAnything/Depth-Anything-V2.git",
@@ -105,9 +108,9 @@ def download_public_weights(*, include_qwen: bool = False) -> None:
             SAM3_MODEL_BYTES,
         ),
         (
-            "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt",
-            root / "models/sam2/checkpoints/sam2.1_hiera_small.pt",
-            None,
+            "https://github.com/hkchengrex/Cutie/releases/download/v1.0/cutie-base-mega.pth",
+            root / "models/Cutie/weights/cutie-base-mega.pth",
+            140_443_788,
         ),
         (
             "https://huggingface.co/spaces/rolpotamias/WiLoR/resolve/main/pretrained_models/detector.pt",
@@ -180,7 +183,7 @@ def verify_models(*, include_qwen: bool = False) -> list[str]:
     required = [
         *(["models/qwen3-vl-4b/config.json"] if include_qwen else []),
         "models/mlx-sam3/weights/sam3-image/model.safetensors",
-        "models/sam2/checkpoints/sam2.1_hiera_small.pt",
+        "models/Cutie/weights/cutie-base-mega.pth",
         "models/WiLoR/pretrained_models/detector.pt",
         "models/WiLoR/pretrained_models/wilor_final.ckpt",
         "models/WiLoR/mano_data/MANO_RIGHT.pkl",
@@ -198,6 +201,11 @@ def verify_models(*, include_qwen: bool = False) -> list[str]:
         if (
             item.endswith("sam3-image/model.safetensors")
             and path.stat().st_size != SAM3_MODEL_BYTES
+        ):
+            problems.append(f"{item} (wrong file size)")
+        if (
+            item.endswith("Cutie/weights/cutie-base-mega.pth")
+            and path.stat().st_size != 140_443_788
         ):
             problems.append(f"{item} (wrong file size)")
     if include_qwen and not list(
@@ -221,7 +229,7 @@ def model_provenance() -> dict:
 
     files = {
         "qwen3_vl_config": root / "models/qwen3-vl-4b/config.json",
-        "sam2": root / "models/sam2/checkpoints/sam2.1_hiera_small.pt",
+        "cutie": root / "models/Cutie/weights/cutie-base-mega.pth",
         "wilor_detector": root / "models/WiLoR/pretrained_models/detector.pt",
         "wilor": root / "models/WiLoR/pretrained_models/wilor_final.ckpt",
         "depth_anything_v2_small": root
