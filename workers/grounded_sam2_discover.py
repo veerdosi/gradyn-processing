@@ -15,7 +15,33 @@ except ModuleNotFoundError:
     from workers.common import encode_coco_rle, frame_paths, job_paths, resize_for_max_side, save_json
 
 SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
-BROAD_PROMPTS = ["tool", "object", "equipment", "block", "part", "instrument", "workpiece"]
+BROAD_PROMPTS = [
+    "tool",
+    "hand tool",
+    "object",
+    "small object",
+    "equipment",
+    "instrument",
+    "implement",
+    "device",
+    "part",
+    "component",
+    "piece",
+    "attachment",
+    "accessory",
+    "material",
+    "workpiece",
+    "block",
+    "bar",
+    "rod",
+    "tube",
+    "plate",
+    "sheet",
+    "fastener",
+    "hardware",
+    "fixture",
+    "paper",
+]
 
 
 def choose_torch_device(requested: str):
