@@ -54,8 +54,6 @@ done
   "numpy>=2,<2.3" "opencv-python==4.12.0.88" \
   "torch==2.5.1" "torchvision==0.20.1" \
   "transformers==4.57.3" "mlx-lm==0.29.1" "mlx-vlm==0.3.4"
-"$CONDA_BIN" run -n gradyn-objects python -m pip install -e "$ROOT/models/mlx-sam3"
-"$CONDA_BIN" run -n gradyn-objects python -m pip install pyarrow scipy
 "$CONDA_BIN" run -n gradyn-inference python -m pip install \
   "numpy==1.26.4" "torch==2.5.1" "torchvision==0.20.1" \
   pytorch-lightning==2.2.4 lightning-utilities \

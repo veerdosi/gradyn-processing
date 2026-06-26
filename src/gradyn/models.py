@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
 import hashlib
 import json
 import zipfile
@@ -15,22 +13,33 @@ from .runtime import conda_environment_python, project_root, run_command
 console = Console()
 
 REPOSITORIES = {
-    "mlx-sam3": ("https://github.com/Deekshith-Dade/mlx_sam3.git", "d9a92badb6000a93135e01b89cd81a54e7ff9825"),
+    "mlx-sam3": (
+        "https://github.com/Deekshith-Dade/mlx_sam3.git",
+        "d9a92badb6000a93135e01b89cd81a54e7ff9825",
+    ),
+    "sam2": (
+        "https://github.com/facebookresearch/sam2.git",
+        "main",
+    ),
     "Cutie": (
         "https://github.com/hkchengrex/Cutie.git",
         "ec5cdd4cf16f75c73ad785a2f96fb97dbad4125a",
     ),
-    "WiLoR": ("https://github.com/rolpotamias/WiLoR.git", "fcb911312a38fa8badd30d9656a167485d61b8f9"),
+    "WiLoR": (
+        "https://github.com/rolpotamias/WiLoR.git",
+        "fcb911312a38fa8badd30d9656a167485d61b8f9",
+    ),
     "depth-anything-v2": (
         "https://github.com/DepthAnything/Depth-Anything-V2.git",
         "a561b849ebae10a6f5ef49e26c83cbbcd36c71bf",
     ),
 }
 
-SAM3_MODEL_URL = (
-    "https://huggingface.co/mlx-community/sam3-image/resolve/main/model.safetensors"
+SAM2_SMALL_URL = (
+    "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+    "sam2.1_hiera_small.pt"
 )
-SAM3_MODEL_BYTES = 3_402_867_661
+DINOV2_MODEL_ID = "facebook/dinov2-small"
 
 
 def setup_repositories() -> None:
@@ -49,6 +58,39 @@ def setup_repositories() -> None:
         run_command(["git", "submodule", "update", "--init", "--recursive"], cwd=target)
 
 
+def install_model_runtime_dependencies() -> None:
+    root = project_root()
+    objects_python = conda_environment_python("gradyn-objects")
+    inference_python = conda_environment_python("gradyn-inference")
+    run_command(
+        [
+            objects_python,
+            "-m",
+            "pip",
+            "install",
+            "torch>=2.5.1",
+            "torchvision>=0.20.1",
+            "transformers>=4.57.3",
+            "huggingface-hub>=0.30",
+            "pillow",
+            "pyarrow",
+            "scipy",
+        ]
+    )
+    run_command(
+        [objects_python, "-m", "pip", "install", "-e", str(root / "models/sam2")]
+    )
+    run_command(
+        [
+            inference_python,
+            "-m",
+            "pip",
+            "install",
+            "git+https://github.com/openai/CLIP.git",
+        ]
+    )
+
+
 def _download(
     url: str,
     destination: Path,
@@ -62,7 +104,7 @@ def _download(
                 destination
             ):
                 return
-        destination.unlink()
+    destination.unlink(missing_ok=True)
     partial = destination.with_suffix(destination.suffix + ".partial")
     run_command(
         [
@@ -99,13 +141,13 @@ def _download(
     partial.replace(destination)
 
 
-def download_public_weights(*, include_qwen: bool = False) -> None:
+def download_public_weights() -> None:
     root = project_root()
     downloads = [
         (
-            SAM3_MODEL_URL,
-            root / "models/mlx-sam3/weights/sam3-image/model.safetensors",
-            SAM3_MODEL_BYTES,
+            SAM2_SMALL_URL,
+            root / "models/sam2/checkpoints/sam2.1_hiera_small.pt",
+            None,
         ),
         (
             "https://github.com/hkchengrex/Cutie/releases/download/v1.0/cutie-base-mega.pth",
@@ -131,29 +173,25 @@ def download_public_weights(*, include_qwen: bool = False) -> None:
     ]
     for url, destination, expected_bytes in downloads:
         _download(url, destination, expected_bytes=expected_bytes)
-    if not include_qwen:
-        console.print(
-            "[green]Required explicit-object pipeline weights are ready.[/green]"
-        )
-        return
-    qwen_dir = root / "models/qwen3-vl-4b"
-    if not (qwen_dir / "config.json").exists() or not list(
-        qwen_dir.glob("*.safetensors")
-    ):
-        qwen_dir.mkdir(parents=True, exist_ok=True)
-        code = (
-            "import os; "
-            "os.environ['HF_HUB_DISABLE_XET']='1'; "
-            "from huggingface_hub import snapshot_download; "
-            f"snapshot_download(repo_id='mlx-community/Qwen3-VL-4B-Instruct-4bit', "
-            f"local_dir={str(qwen_dir)!r})"
-        )
-        run_command(
-            [conda_environment_python("gradyn-vocab"), "-u", "-c", code]
-        )
+    hf_models = [
+        (DINOV2_MODEL_ID, root / "models/dinov2-small"),
+    ]
+    for model_id, local_dir in hf_models:
+        if not (local_dir / "config.json").exists() or not list(
+            local_dir.glob("*.safetensors")
+        ):
+            local_dir.mkdir(parents=True, exist_ok=True)
+            code = (
+                "import os; "
+                "os.environ['HF_HUB_DISABLE_XET']='1'; "
+                "from huggingface_hub import snapshot_download; "
+                f"snapshot_download(repo_id={model_id!r}, "
+                f"local_dir={str(local_dir)!r})"
+            )
+            run_command([conda_environment_python("gradyn-objects"), "-u", "-c", code])
     console.print(
-        "[yellow]Qwen3-VL and required public checkpoints are ready. "
-        "Copy licensed MANO_RIGHT.pkl and MANO_LEFT.pkl with `gradyn models install-mano`.[/yellow]"
+        "[green]Required public checkpoints are ready. Copy licensed "
+        "MANO_RIGHT.pkl and MANO_LEFT.pkl with `gradyn models install-mano`.[/green]"
     )
 
 
@@ -178,11 +216,14 @@ def install_mano(right: Path, left: Path) -> None:
     )
 
 
-def verify_models(*, include_qwen: bool = False) -> list[str]:
+def verify_models() -> list[str]:
     root = project_root()
     required = [
-        *(["models/qwen3-vl-4b/config.json"] if include_qwen else []),
-        "models/mlx-sam3/weights/sam3-image/model.safetensors",
+        "models/grounding-dino-base/config.json",
+        "models/dinov2-small/config.json",
+        "models/clip-home/.cache/clip/ViT-B-32.pt",
+        "models/sam2/sam2/__init__.py",
+        "models/sam2/checkpoints/sam2.1_hiera_small.pt",
         "models/Cutie/weights/cutie-base-mega.pth",
         "models/WiLoR/pretrained_models/detector.pt",
         "models/WiLoR/pretrained_models/wilor_final.ckpt",
@@ -199,19 +240,19 @@ def verify_models(*, include_qwen: bool = False) -> list[str]:
         if path.suffix in {".pt", ".ckpt"} and not zipfile.is_zipfile(path):
             problems.append(f"{item} (corrupt or incomplete)")
         if (
-            item.endswith("sam3-image/model.safetensors")
-            and path.stat().st_size != SAM3_MODEL_BYTES
-        ):
-            problems.append(f"{item} (wrong file size)")
-        if (
             item.endswith("Cutie/weights/cutie-base-mega.pth")
             and path.stat().st_size != 140_443_788
         ):
             problems.append(f"{item} (wrong file size)")
-    if include_qwen and not list(
-        (root / "models/qwen3-vl-4b").glob("*.safetensors")
-    ):
-        problems.append("models/qwen3-vl-4b/*.safetensors")
+    for directory in [
+        root / "models/grounding-dino-base",
+        root / "models/dinov2-small",
+    ]:
+        if directory.exists() and not (
+            list(directory.glob("*.safetensors"))
+            or list(directory.glob("*.bin"))
+        ):
+            problems.append(f"{directory.relative_to(root)}/*.safetensors")
     return problems
 
 
@@ -228,7 +269,10 @@ def model_provenance() -> dict:
         return hasher.hexdigest()
 
     files = {
-        "qwen3_vl_config": root / "models/qwen3-vl-4b/config.json",
+        "sam2_1_small": root / "models/sam2/checkpoints/sam2.1_hiera_small.pt",
+        "grounding_dino_base_config": root / "models/grounding-dino-base/config.json",
+        "dinov2_small_config": root / "models/dinov2-small/config.json",
+        "clip_vit_b_32": root / "models/clip-home/.cache/clip/ViT-B-32.pt",
         "cutie": root / "models/Cutie/weights/cutie-base-mega.pth",
         "wilor_detector": root / "models/WiLoR/pretrained_models/detector.pt",
         "wilor": root / "models/WiLoR/pretrained_models/wilor_final.ckpt",

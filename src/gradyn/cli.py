@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,7 +9,13 @@ import typer
 from rich.console import Console
 
 from .config import ProcessConfig
-from .models import download_public_weights, install_mano, setup_repositories, verify_models
+from .models import (
+    download_public_weights,
+    install_mano,
+    install_model_runtime_dependencies,
+    setup_repositories,
+    verify_models,
+)
 from .pipeline import process as run_pipeline
 from .runtime import conda_executable, project_root
 
@@ -36,55 +41,17 @@ def _checkpoint_status(root: Path) -> dict:
             completed[marker.name.removesuffix(".done.json")] = False
 
     partial: dict[str, dict] = {}
-    qwen_progress = work / "qwen_progress"
-    if qwen_progress.exists():
-        metadata_path = qwen_progress / "metadata.json"
+    anchor_progress = work / "object_cluster_progress"
+    if anchor_progress.exists():
+        metadata_path = anchor_progress / "metadata.json"
         metadata = (
             json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
         )
-        partial["qwen"] = {
+        partial["anchors"] = {
             "completed_keyframes": len(
                 [
                     path
-                    for path in qwen_progress.glob("*.json")
-                    if path.name != "metadata.json"
-                ]
-            ),
-            "total_keyframes": len(
-                metadata.get("signature", {}).get("keyframes", [])
-            ),
-        }
-
-    qwen_box_progress = work / "qwen_box_progress"
-    if qwen_box_progress.exists():
-        metadata_path = qwen_box_progress / "metadata.json"
-        metadata = (
-            json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-        )
-        partial["boxes"] = {
-            "completed_keyframes": len(
-                [
-                    path
-                    for path in qwen_box_progress.glob("*.json")
-                    if path.name != "metadata.json"
-                ]
-            ),
-            "total_keyframes": len(
-                metadata.get("signature", {}).get("keyframes", [])
-            ),
-        }
-
-    sam3_progress = work / "sam3_progress"
-    if sam3_progress.exists():
-        metadata_path = sam3_progress / "metadata.json"
-        metadata = (
-            json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
-        )
-        partial["sam3"] = {
-            "completed_keyframes": len(
-                [
-                    path
-                    for path in sam3_progress.glob("*.json")
+                    for path in anchor_progress.glob("*.json")
                     if path.name != "metadata.json"
                 ]
             ),
@@ -173,50 +140,26 @@ def process(
             "resolution and camera mode."
         ),
     ),
-    objects: str = typer.Option(
+    target_labels: str = typer.Option(
         "",
+        "--target-labels",
         help=(
-            "Comma-separated object names for SAM 3 localization and Cutie tracking."
-        ),
-    ),
-    prompt_bank: Path | None = typer.Option(
-        None,
-        help="Task-specific JSON vocabulary for SAM 3 verification.",
-    ),
-    discover_objects: bool = typer.Option(
-        False,
-        "--discover-objects",
-        help=(
-            "Opt in to Qwen3-VL vocabulary discovery when object names are unknown. "
-            "Qwen is disabled by default."
+            "Comma-separated labels CLIP may assign after object tracking."
         ),
     ),
     max_auto_objects: int = typer.Option(
-        8, min=1, max=20, help="Maximum automatically selected object classes."
+        8, min=1, max=20, help="Maximum automatically selected object tracks."
     ),
-    qwen_max_candidates: int = typer.Option(
-        24,
-        "--qwen-max-candidates",
-        min=1,
-        max=100,
-        help="Maximum Qwen-proposed objects offered for approval.",
-    ),
-    qwen_stride: int = typer.Option(
-        360,
-        "--qwen-stride",
-        min=1,
-        help="Run Qwen vocabulary discovery every N source frames.",
-    ),
-    sam3_stride: int = typer.Option(
+    anchor_stride: int = typer.Option(
         90,
-        "--sam3-stride",
+        "--anchor-stride",
         min=1,
-        help="Run SAM 3 verification/localization every N source frames.",
+        help="Run GroundingDINO + SAM2.1 anchor generation every N source frames.",
     ),
-    box_proposer: str = typer.Option(
-        "qwen",
-        "--box-proposer",
-        help="Box proposer before SAM 3: qwen or none.",
+    anchor_device: str = typer.Option(
+        "auto",
+        "--anchor-device",
+        help="Device for GroundingDINO + SAM2.1 anchors: auto, mps, or cpu.",
     ),
     output: Path = typer.Option(..., "-o", "--output"),
     exemplar: list[str] = typer.Option([], help="Repeat OBJECT=/path/image.jpg."),
@@ -240,41 +183,24 @@ def process(
     ),
     no_resume: bool = typer.Option(False),
 ) -> None:
-    object_names = [item.strip() for item in objects.split(",") if item.strip()]
-    vocabulary_sources = sum(
-        [bool(object_names), prompt_bank is not None, discover_objects]
-    )
-    if vocabulary_sources == 0:
-        raise typer.BadParameter(
-            "Specify --objects, use --prompt-bank, or explicitly enable "
-            "--discover-objects."
-        )
-    if vocabulary_sources > 1:
-        raise typer.BadParameter(
-            "Use exactly one object vocabulary source: --objects, --prompt-bank, "
-            "or --discover-objects."
-        )
-    if box_proposer not in {"qwen", "none"}:
-        raise typer.BadParameter("--box-proposer must be qwen or none")
-    missing = verify_models(include_qwen=discover_objects or box_proposer == "qwen")
-    if missing:
-        console.print("[red]Missing required model assets:[/red]")
-        for item in missing:
-            console.print(f"  - {item}")
-        raise typer.Exit(2)
+    label_names = [item.strip() for item in target_labels.split(",") if item.strip()]
+    if anchor_device not in {"auto", "mps", "cpu"}:
+        raise typer.BadParameter("--anchor-device must be auto, mps, or cpu")
+    # missing = verify_models()
+    # if missing:
+    #     console.print("[red]Missing required model assets:[/red]")
+    #     for item in missing:
+    #         console.print(f"  - {item}")
+    #     raise typer.Exit(2)
     config = ProcessConfig(
         video=video.resolve(),
         output=output.resolve(),
         camera=camera,
         focal_length_px=focal_length_px,
-        objects=object_names,
-        prompt_bank=prompt_bank.expanduser().resolve() if prompt_bank else None,
-        discover_objects=discover_objects,
+        target_labels=label_names,
         max_auto_objects=max_auto_objects,
-        qwen_max_candidates=qwen_max_candidates,
-        qwen_stride=qwen_stride,
-        sam3_stride=sam3_stride,
-        box_proposer=box_proposer,
+        anchor_stride=anchor_stride,
+        anchor_device=anchor_device,
         exemplars=_parse_exemplars(exemplar),
         depth_every=depth_every,
         depth_input_size=depth_input_size,
@@ -290,17 +216,17 @@ def doctor() -> None:
     report = {
         "ffmpeg": shutil.which("ffmpeg") is not None,
         "models": {
-            "ok": not verify_models(include_qwen=True),
-            "problems": verify_models(include_qwen=True),
+            "ok": not verify_models(),
+            "problems": verify_models(),
         },
         "core": _environment_check(
             "gradyn-core", "import gradyn; print(gradyn.__version__)"
         ),
         "objects": _environment_check(
             "gradyn-objects",
-            "import torch, mlx.core as mx, sam3; "
+            "import torch, transformers, sam2; "
             "print({'mps': torch.backends.mps.is_available(), "
-            "'metal': mx.metal.is_available()})",
+            "'transformers': transformers.__version__, 'sam2': True})",
         ),
         "vocab": _environment_check(
             "gradyn-vocab",
@@ -337,70 +263,6 @@ def status(
     )
 
 
-@app.command("select-objects")
-def select_objects(
-    output: Path = typer.Argument(..., exists=True, file_okay=False),
-    objects: str = typer.Option(
-        ...,
-        "--objects",
-        help="Comma-separated Qwen-proposed labels to send to SAM 3.",
-    ),
-) -> None:
-    """Approve Qwen-proposed labels before SAM 3 localization."""
-    root = output.expanduser().resolve()
-    qwen_discovery = root / "objects" / "qwen_discovery.json"
-    sam3_discovery = root / "objects" / "discovery.json"
-    discovery_path = qwen_discovery if qwen_discovery.exists() else sam3_discovery
-    if not discovery_path.exists():
-        raise typer.BadParameter(
-            "No automatic discovery exists yet. Run `gradyn process` first."
-        )
-    discovery = json.loads(discovery_path.read_text())
-    source_items = (
-        discovery.get("candidates", [])
-        if discovery_path == qwen_discovery
-        else discovery.get("selected_objects", [])
-    )
-    available = {str(item["label"]).casefold(): item for item in source_items}
-    requested = [
-        value.strip() for value in objects.split(",") if value.strip()
-    ]
-    if not requested:
-        raise typer.BadParameter("Select at least one object.")
-    unknown = [value for value in requested if value.casefold() not in available]
-    if unknown:
-        raise typer.BadParameter(
-            "Unknown or unverified labels: "
-            + ", ".join(unknown)
-            + ". Available: "
-            + ", ".join(item["label"] for item in available.values())
-        )
-    selected = [available[value.casefold()] for value in requested]
-    approval = {
-        "discovery_sha256": hashlib.sha256(
-            discovery_path.read_bytes()
-        ).hexdigest(),
-        "source": "qwen3_vl" if discovery_path == qwen_discovery else "sam3",
-        "selected_labels": [str(item["label"]) for item in selected],
-    }
-    approval_path = root / "objects" / "approved_prompts.json"
-    temporary = approval_path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(approval, indent=2))
-    temporary.replace(approval_path)
-    candidate_path = root / ".work" / "approved_candidate_prompts.json"
-    candidate_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_candidates = candidate_path.with_suffix(".json.tmp")
-    temporary_candidates.write_text(
-        json.dumps(approval["selected_labels"], indent=2)
-    )
-    temporary_candidates.replace(candidate_path)
-    console.print(
-        "[bold green]Approved for SAM 3 verification:[/bold green] "
-        + ", ".join(item["label"] for item in selected)
-    )
-    console.print("Rerun the original `gradyn process ...` command to continue.")
-
-
 @app.command("seed-object")
 def seed_object(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
@@ -412,7 +274,7 @@ def seed_object(
         help="Source-pixel box as x1,y1,x2,y2.",
     ),
 ) -> None:
-    """Add one visual object box used to initialize SAM 3 and Cutie."""
+    """Add one visual object box used to initialize anchor generation and Cutie."""
     root = output.expanduser().resolve()
     metadata = json.loads((root / "source" / "video_metadata.json").read_text())
     if frame >= int(metadata["frame_count"]):
@@ -457,13 +319,6 @@ def seed_object(
     temporary_seed.write_text(json.dumps(seeds, indent=2))
     temporary_seed.replace(seed_path)
 
-    candidate_path = root / ".work" / "approved_candidate_prompts.json"
-    candidates = json.loads(candidate_path.read_text()) if candidate_path.exists() else []
-    if canonical not in candidates:
-        candidates.append(canonical)
-    temporary_candidates = candidate_path.with_suffix(".json.tmp")
-    temporary_candidates.write_text(json.dumps(candidates, indent=2))
-    temporary_candidates.replace(candidate_path)
     console.print(
         f"[bold green]Saved object seed:[/bold green] {canonical} at frame "
         f"{frame}, box {values}"
@@ -475,7 +330,7 @@ def seed_object(
 def rebuild_objects(
     output: Path = typer.Argument(..., exists=True, file_okay=False),
 ) -> None:
-    """Rebuild SAM 3/Cutie objects while preserving preprocessing, hands, and depth."""
+    """Rebuild object anchors/Cutie tracks while preserving preprocessing, hands, and depth."""
     from .exports import build_exports
     from .quality import build_quality_report
     from .runtime import mark_stage, run_worker
@@ -485,64 +340,31 @@ def rebuild_objects(
     config = manifest["config"]
     config_hash = str(manifest["config_hash"])
     common = ["--job", str(root)]
-    object_names = [str(value) for value in config.get("objects", [])]
-    prompt_bank = config.get("prompt_bank")
-    sam3_args = [
+    target_labels = [
+        str(value)
+        for value in config.get("target_labels", config.get("objects", []))
+    ]
+    anchor_args = [
         *common,
-        "--objects-json",
-        json.dumps(object_names),
+        "--target-labels-json",
+        json.dumps(target_labels),
         "--max-auto-objects",
         str(config.get("max_auto_objects", 8)),
         "--exemplars-json",
         json.dumps(config.get("exemplars", {})),
         "--stride",
-        str(config.get("sam3_stride", 90)),
+        str(config.get("anchor_stride", 90)),
         "--max-side",
         str(config.get("max_inference_side", 960)),
+        "--device",
+        str(config.get("anchor_device", "auto")),
     ]
-    if not object_names and not prompt_bank:
-        candidate_path = root / ".work" / "approved_candidate_prompts.json"
-        if not candidate_path.exists():
-            raise typer.BadParameter(
-                "No approved object list exists. Run `gradyn select-objects` first."
-            )
-        sam3_args.extend(
-            [
-                "--candidate-prompts-json",
-                str(candidate_path),
-                "--candidate-source",
-                "qwen3_vl_approved",
-            ]
-        )
-    if prompt_bank:
-        sam3_args.extend(["--prompt-bank", str(prompt_bank)])
-    if config.get("box_proposer", "qwen") == "qwen":
-        box_args = [
-            *common,
-            "--objects-json",
-            json.dumps(object_names),
-            "--stride",
-            str(config.get("sam3_stride", 90)),
-            "--max-side",
-            str(config.get("qwen_box_max_side", 672)),
-            "--max-tokens",
-            str(config.get("qwen_box_max_tokens", 384)),
-        ]
-        candidate_path = root / ".work" / "approved_candidate_prompts.json"
-        if candidate_path.exists():
-            box_args.extend(["--candidate-prompts-json", str(candidate_path)])
-        if prompt_bank:
-            box_args.extend(["--prompt-bank", str(prompt_bank)])
-        run_worker("gradyn-vocab", "qwen_boxes.py", box_args)
-        sam3_args.extend(
-            ["--box-proposals-json", str(root / ".work" / "qwen_box_proposals.json")]
-        )
     manual_seeds = root / "objects" / "manual_seeds.json"
     if manual_seeds.exists():
-        sam3_args.extend(["--manual-seeds-json", str(manual_seeds)])
+        anchor_args.extend(["--manual-seeds-json", str(manual_seeds)])
 
-    run_worker("gradyn-objects", "sam3_discover.py", sam3_args)
-    mark_stage(root / ".work", "sam3", config_hash)
+    run_worker("gradyn-objects", "grounded_sam2_discover.py", anchor_args)
+    mark_stage(root / ".work", "anchors", config_hash)
     run_worker(
         "gradyn-inference",
         "cutie_track.py",
@@ -565,16 +387,16 @@ def rebuild_tracks(
         help="Cutie device for rebuilding object tracks: auto, mps, or cpu.",
     ),
 ) -> None:
-    """Rebuild only Cutie tracks from the existing SAM 3 discoveries."""
+    """Rebuild only Cutie tracks from the existing object anchors."""
     from .exports import build_exports
     from .quality import build_quality_report
     from .runtime import mark_stage, run_worker
 
     root = output.expanduser().resolve()
-    discoveries = root / ".work" / "sam3_discoveries.json"
+    discoveries = root / ".work" / "anchor_discoveries.json"
     if not discoveries.exists():
         raise typer.BadParameter(
-            "Existing SAM 3 discoveries are missing; use `gradyn rebuild-objects`."
+            "Existing object anchors are missing; use `gradyn rebuild-objects`."
         )
     if device not in {"auto", "mps", "cpu"}:
         raise typer.BadParameter("--device must be auto, mps, or cpu")
@@ -707,7 +529,8 @@ def calibrate_camera(
 @models_app.command("setup")
 def models_setup() -> None:
     setup_repositories()
-    download_public_weights(include_qwen=True)
+    install_model_runtime_dependencies()
+    download_public_weights()
 
 
 @models_app.command("install-mano")
@@ -720,7 +543,7 @@ def models_install_mano(
 
 @models_app.command("verify")
 def models_verify() -> None:
-    missing = verify_models(include_qwen=True)
+    missing = verify_models()
     if missing:
         console.print(json.dumps({"ready": False, "missing": missing}, indent=2))
         raise typer.Exit(1)

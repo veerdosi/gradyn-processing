@@ -31,17 +31,12 @@ from workers.cutie_track import (
     segment_cache_name,
     select_trusted_anchors,
 )
-from workers.sam3_discover import (
-    select_auto_labels,
-    select_object_candidate,
+from workers.grounded_sam2_discover import (
+    cluster_embeddings,
+    cluster_score,
+    mask_passes_geometry,
+    select_diverse_clusters,
 )
-from workers.qwen_discover import (
-    DISCOVERY_PROMPT,
-    aggregate_objects,
-    normalize_object_name,
-    parse_object_response,
-)
-from workers.qwen_boxes import parse_box_response
 
 
 def test_coco_rle_round_trip() -> None:
@@ -60,43 +55,6 @@ def test_overlay_draws_mask_contour_and_exact_bbox_extent() -> None:
     assert rendered[2, 3, 0] > 200
     assert rendered[6, 8, 0] > 200
     assert rendered[7, 9].sum() == 0
-
-
-def test_qwen_box_response_keeps_requested_labels_only() -> None:
-    parsed = parse_box_response(
-        """
-        ```json
-        {"objects": [
-          {"label": "metal sheet", "visible": true,
-           "box_xyxy": [10, 20, 300, 220], "confidence": 0.82},
-          {"label": "hand", "visible": true,
-           "box_xyxy": [0, 0, 50, 50], "confidence": 0.99}
-        ]}
-        ```
-        """,
-        requested=["metal sheet", "hammer"],
-        width=672,
-        height=378,
-    )
-    assert parsed["metal sheet"]["found"]
-    assert parsed["metal sheet"]["box_xyxy"] == [10.0, 20.0, 300.0, 220.0]
-    assert not parsed["hammer"]["found"]
-
-
-def test_qwen_box_response_rejects_duplicate_cross_label_boxes() -> None:
-    parsed = parse_box_response(
-        '{"objects": ['
-        '{"label": "hammer", "visible": true, '
-        '"box_xyxy": [100, 100, 260, 220], "confidence": 0.8},'
-        '{"label": "metal punch", "visible": true, '
-        '"box_xyxy": [105, 105, 258, 218], "confidence": 0.82}'
-        "]}",
-        requested=["hammer", "metal punch"],
-        width=672,
-        height=378,
-    )
-    assert not parsed["hammer"]["found"]
-    assert not parsed["metal punch"]["found"]
 
 
 def test_quarantine_interval_merge() -> None:
@@ -302,82 +260,44 @@ def test_cutie_keeps_confident_small_anchor_without_label_special_case() -> None
     assert rejected == []
 
 
-def test_automatic_labels_reject_weak_semantic_matches() -> None:
-    discoveries = [
-        {
-            "frame_index": frame,
-            "label": "wrong tool label",
-            "found": True,
-            "score": 0.38,
-        }
-        for frame in [0, 90, 180]
+def test_object_mask_geometry_rejects_background_like_masks() -> None:
+    good = np.zeros((100, 100), dtype=bool)
+    good[30:55, 35:65] = True
+    assert mask_passes_geometry(good, np.asarray([35, 30, 65, 55], dtype=np.float32))
+
+    huge = np.ones((100, 100), dtype=bool)
+    assert not mask_passes_geometry(huge, np.asarray([0, 0, 100, 100], dtype=np.float32))
+
+    strip = np.zeros((100, 100), dtype=bool)
+    strip[45:52, 0:100] = True
+    assert not mask_passes_geometry(strip, np.asarray([0, 45, 100, 52], dtype=np.float32))
+
+
+def test_dinov2_cluster_links_similar_objects_across_keyframes_only() -> None:
+    candidates = [
+        {"frame_index": 0, "embedding": [1.0, 0.0], "area_fraction": 0.02, "aspect_ratio": 2.0, "detector_score": 0.4},
+        {"frame_index": 90, "embedding": [0.98, 0.02], "area_fraction": 0.021, "aspect_ratio": 2.1, "detector_score": 0.35},
+        {"frame_index": 0, "embedding": [0.97, 0.03], "area_fraction": 0.02, "aspect_ratio": 2.0, "detector_score": 0.4},
+        {"frame_index": 90, "embedding": [0.0, 1.0], "area_fraction": 0.08, "aspect_ratio": 1.1, "detector_score": 0.5},
     ]
-    selected, summary = select_auto_labels(discoveries, 4, 8)
-    assert selected == []
-    assert summary == []
+    clusters = cluster_embeddings(candidates, 0.95)
+    assert sorted(len(cluster) for cluster in clusters) == [1, 1, 2]
+    linked = max(clusters, key=len)
+    assert {candidates[index]["frame_index"] for index in linked} == {0, 90}
+    assert cluster_score([candidates[index] for index in linked], 2) > 0.7
 
 
-def test_sam3_prefers_substantial_foreground_instance_over_top_edge_strip() -> None:
-    image = Image.new("RGB", (200, 100), "white")
-    masks = np.zeros((2, 100, 200), dtype=bool)
-    masks[0, 0:8, 55:165] = True
-    masks[1, 22:88, 38:168] = True
-    boxes = np.asarray([[55, 0, 165, 8], [38, 22, 168, 88]], dtype=np.float32)
-    scores = np.asarray([0.92, 0.78], dtype=np.float32)
-    chosen, diagnostics = select_object_candidate(image, masks, boxes, scores)
-    assert chosen == 1
-    assert diagnostics[0]["edge_penalty"] > diagnostics[1]["edge_penalty"]
-
-
-def test_sam3_continuity_breaks_tie_between_repeated_instances() -> None:
-    image = Image.new("RGB", (200, 100), "white")
-    masks = np.zeros((2, 100, 200), dtype=bool)
-    masks[0, 20:80, 15:75] = True
-    masks[1, 20:80, 110:170] = True
-    boxes = np.asarray([[15, 20, 75, 80], [110, 20, 170, 80]], dtype=np.float32)
-    scores = np.asarray([0.82, 0.83], dtype=np.float32)
-    previous = np.asarray([112, 21, 172, 81], dtype=np.float32)
-    chosen, _ = select_object_candidate(
-        image, masks, boxes, scores, previous_box=previous
-    )
-    assert chosen == 1
-
-
-def test_sam3_prompt_box_breaks_tie_between_candidates() -> None:
-    image = Image.new("RGB", (200, 100), "white")
-    masks = np.zeros((2, 100, 200), dtype=bool)
-    masks[0, 20:80, 15:75] = True
-    masks[1, 20:80, 110:170] = True
-    boxes = np.asarray([[15, 20, 75, 80], [110, 20, 170, 80]], dtype=np.float32)
-    scores = np.asarray([0.83, 0.82], dtype=np.float32)
-    prompt = np.asarray([108, 18, 172, 82], dtype=np.float32)
-    chosen, diagnostics = select_object_candidate(
-        image, masks, boxes, scores, prompt_box=prompt
-    )
-    assert chosen == 1
-    assert diagnostics[1]["box_prompt_agreement"] > diagnostics[0]["box_prompt_agreement"]
-
-
-def test_approved_overlapping_objects_are_not_deduplicated() -> None:
-    mask = np.zeros((20, 20), dtype=bool)
-    mask[4:16, 4:16] = True
-    discoveries = []
-    for label in ("welding torch", "metal sheet"):
-        for frame_index in (0, 60, 120):
-            discoveries.append(
-                {
-                    "frame_index": frame_index,
-                    "label": label,
-                    "found": True,
-                    "score": 0.9,
-                    "mask_rle": encode_coco_rle(mask),
-                }
-            )
-    _, selected = select_auto_labels(discoveries, 3, 4)
-    assert {item["label"] for item in selected} == {
-        "welding torch",
-        "metal sheet",
-    }
+def test_object_cluster_selection_skips_duplicate_boxes() -> None:
+    clusters = [
+        (0.9, [], {"box_xyxy": [10, 10, 50, 50]}),
+        (0.8, [], {"box_xyxy": [12, 12, 48, 48]}),
+        (0.7, [], {"box_xyxy": [80, 80, 120, 120]}),
+    ]
+    selected = select_diverse_clusters(clusters, 2)
+    assert [item[2]["box_xyxy"] for item in selected] == [
+        [10, 10, 50, 50],
+        [80, 80, 120, 120],
+    ]
 
 
 def test_temporal_hand_selection_prefers_continuous_candidate() -> None:
@@ -461,48 +381,6 @@ def test_projected_landmark_gate_rejects_displaced_mesh() -> None:
         detector,
         box,
     )
-
-
-def test_qwen_object_parsing_and_persistence_filtering() -> None:
-    assert parse_object_response(
-        '```json\n{"objects":["Welding Gun","spark","Metal Sheet","Black Cable","Clamps"]}\n```'
-    ) == ["welding torch", "metal sheet", "cable", "clamp"]
-    assert normalize_object_name("repair") is None
-    assert normalize_object_name("yellow protective gear") is None
-    ranked = aggregate_objects(
-        {
-            0: ["welding gun", "spark", "clamp"],
-            90: ["welder", "clamp"],
-            180: ["metal sheet"],
-        },
-        max_candidates=8,
-        minimum_hits=2,
-    )
-    assert [item["label"] for item in ranked] == ["welding torch", "clamp"]
-    deduplicated = aggregate_objects(
-        {
-            0: ["white machine", "welding machine", "pink container"],
-            30: ["blue machine", "welding machine", "container"],
-        },
-        max_candidates=8,
-        minimum_hits=1,
-    )
-    assert {item["label"] for item in deduplicated} == {
-        "container",
-        "welding machine",
-    }
-
-
-def test_qwen_prompt_is_task_agnostic_and_supports_lamination() -> None:
-    prompt = DISCOVERY_PROMPT.casefold()
-    assert "do not assume a particular" in prompt
-    assert "industry or task" in prompt
-    assert "lamination" in prompt
-    assert "paper sheet" in prompt
-    assert "industrial-work frame" not in prompt
-    assert parse_object_response(
-        '{"objects":["Laminating Machine","Printed Paper","Plastic Film","Rollers"]}'
-    ) == ["laminator", "printed page", "laminating film", "roller"]
 
 
 def test_atomic_checkpoint_writers(tmp_path: Path) -> None:

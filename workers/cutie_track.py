@@ -4,6 +4,7 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import shutil
 import sys
 from collections import defaultdict
@@ -21,6 +22,8 @@ LIFECYCLE_COLLAPSE_RUN = 5
 TRUSTED_ANCHOR_PROPAGATION = 60
 REPLACEMENT_STABILIZATION_SECONDS = 0.8
 MAX_UNCACHED_INTERVAL_FRAMES = 900
+CLIP_LABEL_PROB_THRESHOLD = 0.36
+PROPAGATED_AREA_COLLAPSE_RATIO = 0.20
 
 try:
     from common import (
@@ -89,6 +92,146 @@ def unpack_masks(packed: np.ndarray, width: int) -> list[np.ndarray]:
     return [values[index] for index in range(len(values))]
 
 
+def masked_crop_for_clip(
+    image: Image.Image,
+    mask: np.ndarray,
+    *,
+    pad_fraction: float = 0.18,
+) -> Image.Image:
+    x, y, width, height = mask_bbox(mask)
+    if width <= 0 or height <= 0:
+        return image
+    pad = int(max(width, height) * pad_fraction)
+    left = max(0, x - pad)
+    top = max(0, y - pad)
+    right = min(image.width, x + width + pad)
+    bottom = min(image.height, y + height + pad)
+    array = np.asarray(image).copy()
+    clipped_mask = mask.astype(bool)
+    array[~clipped_mask] = 255
+    return Image.fromarray(array).crop((left, top, right, bottom))
+
+
+def clip_label_tracks(
+    *,
+    root: Path,
+    frames: list[Path],
+    masks_by_object: dict[int, dict[int, np.ndarray]],
+    confidence_by_object: dict[int, dict[int, float]],
+    fallback_labels: dict[int, str],
+    target_labels: list[str],
+    device_name: str,
+) -> tuple[dict[int, str], dict[int, dict]]:
+    if not target_labels:
+        return fallback_labels, {}
+
+    import clip
+    import torch
+
+    clip_home = root / "models" / "clip-home"
+    clip_checkpoint = clip_home / ".cache" / "clip" / "ViT-B-32.pt"
+    if not clip_checkpoint.exists():
+        raise SystemExit(
+            "CLIP ViT-B/32 checkpoint is missing at "
+            f"{clip_checkpoint}. Restore models/clip-home before tracking."
+        )
+
+    device = torch.device(device_name)
+    previous_home = os.environ.get("HOME")
+    os.environ["HOME"] = str(clip_home)
+    try:
+        model, preprocess = clip.load("ViT-B/32", device=device, download_root=None)
+    finally:
+        if previous_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = previous_home
+    model.eval()
+    text = clip.tokenize([f"a photo of a {label}" for label in target_labels]).to(device)
+
+    details: dict[int, dict] = {}
+    probability_by_object: dict[int, list[float]] = {}
+    with torch.inference_mode():
+        for object_id, frame_masks in sorted(masks_by_object.items()):
+            candidates = [
+                (
+                    confidence_by_object[object_id].get(frame_index, 0.0)
+                    * max(float(mask.sum()), 1.0) ** 0.5,
+                    frame_index,
+                    mask,
+                )
+                for frame_index, mask in frame_masks.items()
+                if mask.any()
+            ]
+            if not candidates:
+                continue
+            _, frame_index, mask = max(candidates, key=lambda item: item[0])
+            image = Image.open(frames[frame_index]).convert("RGB")
+            crop = masked_crop_for_clip(image, mask)
+            image_tensor = preprocess(crop).unsqueeze(0).to(device)
+            logits_per_image, _ = model(image_tensor, text)
+            probabilities = (
+                logits_per_image.softmax(dim=1)[0].detach().cpu().numpy()
+            )
+            ranking = sorted(
+                [
+                    (float(probabilities[index]), target_labels[index])
+                    for index in range(len(target_labels))
+                ],
+                reverse=True,
+            )
+            score, label = ranking[0]
+            probability_by_object[object_id] = [
+                float(probabilities[index]) for index in range(len(target_labels))
+            ]
+            details[object_id] = {
+                "object_id": object_id,
+                "label": f"unknown object {object_id}",
+                "accepted": False,
+                "representative_frame": int(frame_index),
+                "clip_score": score,
+                "scores": [
+                    {"label": candidate_label, "score": candidate_score}
+                    for candidate_score, candidate_label in ranking
+                ],
+            }
+
+    final_labels = dict(fallback_labels)
+    assignments: dict[int, tuple[str, float]] = {}
+    used_objects: set[int] = set()
+    used_labels: set[int] = set()
+    edges = sorted(
+        [
+            (scores[label_index], object_id, label_index)
+            for object_id, scores in probability_by_object.items()
+            for label_index in range(len(scores))
+        ],
+        reverse=True,
+    )
+    for score, object_id, label_index in edges:
+        if object_id in used_objects or label_index in used_labels:
+            continue
+        if score < CLIP_LABEL_PROB_THRESHOLD:
+            continue
+        used_objects.add(object_id)
+        used_labels.add(label_index)
+        assignments[object_id] = (target_labels[label_index], float(score))
+    for object_id in sorted(probability_by_object):
+        label, score = assignments.get(
+            object_id,
+            (f"unknown object {object_id}", max(probability_by_object[object_id])),
+        )
+        final_labels[object_id] = label
+        details[object_id]["label"] = label
+        details[object_id]["accepted"] = object_id in assignments
+        details[object_id]["clip_score"] = score
+
+    del model
+    if device_name == "mps":
+        torch.mps.empty_cache()
+    return final_labels, details
+
+
 def mask_iou(first: np.ndarray, second: np.ndarray) -> float:
     union = np.logical_or(first, second).sum()
     if union == 0:
@@ -118,6 +261,12 @@ def primary_component(mask: np.ndarray) -> tuple[np.ndarray, float]:
     primary_label = int(component_areas.argmax())
     cleaned = np.logical_and(mask, components == primary_label)
     return cleaned, float(cleaned.sum() / area)
+
+
+def propagated_mask_is_plausible(mask: np.ndarray | None, anchor_area: int) -> bool:
+    if mask is None or not mask.any():
+        return False
+    return int(mask.sum()) >= PROPAGATED_AREA_COLLAPSE_RATIO * max(anchor_area, 1)
 
 
 def fuse_directional_masks(
@@ -407,6 +556,7 @@ def choose_device(requested: str) -> str:
 
 SEVERE_FRAGMENT_COLLAPSE_RATIO = 0.15
 FRAGMENT_COLLAPSE_SCORE_GATE = 0.72
+LOW_ANCHOR_CONFIDENCE_GATE = 0.40
 
 
 def select_trusted_anchors(items: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -422,9 +572,15 @@ def select_trusted_anchors(items: list[dict]) -> tuple[list[dict], list[dict]]:
         manual = item.get("source") == "user_visual_initialization"
         label = str(item["label"])
         reasons: list[str] = []
-        score = float(item.get("score", 1.0))
-        if score < 0.50 and not manual:
-            reasons.append("low_semantic_score")
+        has_anchor_confidence = "anchor_confidence" in item
+        score = float(item.get("anchor_confidence", item.get("score", 1.0)))
+        low_score_gate = LOW_ANCHOR_CONFIDENCE_GATE if has_anchor_confidence else 0.50
+        if score < low_score_gate and not manual:
+            reasons.append(
+                "low_anchor_confidence"
+                if has_anchor_confidence
+                else "low_semantic_score"
+            )
         if (
             accepted_areas
             and area < SEVERE_FRAGMENT_COLLAPSE_RATIO * recent_median
@@ -442,6 +598,7 @@ def select_trusted_anchors(items: list[dict]) -> tuple[list[dict], list[dict]]:
                     "recent_trusted_area_px": recent_median,
                     "fragment_collapse_ratio": SEVERE_FRAGMENT_COLLAPSE_RATIO,
                     "fragment_collapse_score_gate": FRAGMENT_COLLAPSE_SCORE_GATE,
+                    "anchor_confidence_gate": LOW_ANCHOR_CONFIDENCE_GATE,
                     "reasons": reasons,
                 }
             )
@@ -475,15 +632,20 @@ def main() -> None:
     paths = job_paths(args.job)
     fps = source_fps(paths["root"]) or 30.0
     frames = frame_paths(args.job)
-    discoveries = json.loads(
-        (paths["work"] / "sam3_discoveries.json").read_text()
-    )
+    discoveries = json.loads((paths["work"] / "anchor_discoveries.json").read_text())
     discovery_summary_path = paths["objects"] / "discovery.json"
     discovery_summary = (
         json.loads(discovery_summary_path.read_text())
         if discovery_summary_path.exists()
         else {}
     )
+    target_labels = [
+        str(value)
+        for value in discovery_summary.get(
+            "target_labels",
+            discovery_summary.get("requested_labels", []),
+        )
+    ]
     labels: dict[int, str] = {
         int(item["object_id"]): str(item["label"])
         for item in discovery_summary.get("selected_objects", [])
@@ -515,7 +677,7 @@ def main() -> None:
     )
     if rejected_anchors:
         print(
-            "Cutie rejected unsafe SAM 3 anchors: "
+            "Cutie rejected unsafe object anchors: "
             + ", ".join(
                 f"{item['label']}@{item['frame_index']} "
                 f"({'+'.join(item['reasons'])})"
@@ -559,7 +721,7 @@ def main() -> None:
     print(
         f"Cutie tracking on {device_name} at {args.internal_size}px; "
         f"mem_every={mem_every}, max_mem_frames={max_mem_frames}; "
-        "one object and one SAM 3 anchor interval at a time.",
+        "one object and one anchor interval at a time.",
         flush=True,
     )
     device = torch.device(device_name)
@@ -616,7 +778,7 @@ def main() -> None:
                 f"{start_frame}-{end_frame} "
                 f"({end_frame - start_frame + 1} frames exceeds "
                 f"{MAX_UNCACHED_INTERVAL_FRAMES}); this sparse-anchor gap "
-                "needs a closer SAM 3/manual anchor.",
+                "needs a closer generated/manual anchor.",
                 flush=True,
             )
             anchor_mask = decode_coco_rle(anchor["mask_rle"])
@@ -819,6 +981,48 @@ def main() -> None:
                 by_object[object_id] = anchors
 
             current_instance = 1
+            first_anchor = anchors[0]
+            first_anchor_area = int(decode_coco_rle(first_anchor["mask_rle"]).sum())
+            head_end = int(first_anchor["frame_index"])
+            if head_end > 0:
+                head_masks, head_confidences = run_direction(
+                    object_id,
+                    label,
+                    first_anchor,
+                    0,
+                    head_end,
+                    "backward",
+                )
+                for frame_index in range(0, head_end + 1):
+                    if frame_index == head_end:
+                        mask = decode_coco_rle(first_anchor["mask_rle"])
+                        component_fraction = 1.0
+                        source = "object_anchor"
+                    else:
+                        mask, component_fraction = primary_component(
+                            head_masks[frame_index]
+                        )
+                        if component_fraction < 0.65 or not propagated_mask_is_plausible(
+                            mask, first_anchor_area
+                        ):
+                            mask = None
+                        source = (
+                            "cutie_backward_head"
+                            if mask is not None
+                            else "cutie_incoherent"
+                        )
+                    if mask is not None and mask.any():
+                        masks_by_object[object_id][frame_index] = mask
+                    confidence_by_object[object_id][frame_index] = (
+                        head_confidences[frame_index]
+                    )
+                    source_by_object[object_id][frame_index] = source
+                    instance_by_object[object_id][frame_index] = current_instance
+                    agreement_by_object[object_id][frame_index] = 0.0
+                    component_fraction_by_object[object_id][
+                        frame_index
+                    ] = component_fraction
+
             for anchor_number in range(len(anchors) - 1):
                 left_anchor = anchors[anchor_number]
                 right_anchor = anchors[anchor_number + 1]
@@ -901,7 +1105,7 @@ def main() -> None:
                         )
                         confidence = forward_confidences[frame_index]
                         source = (
-                            "sam3_anchor"
+                            "object_anchor"
                             if frame_index == start_frame
                             else "cutie_lifecycle_forward"
                         )
@@ -918,7 +1122,7 @@ def main() -> None:
                         )
                         confidence = backward_confidences[frame_index]
                         source = (
-                            "sam3_anchor"
+                            "object_anchor"
                             if frame_index == end_frame
                             else "cutie_lifecycle_backward"
                         )
@@ -938,14 +1142,14 @@ def main() -> None:
                         agreement = 1.0
                         component_fraction = 1.0
                         confidence = float(left_anchor.get("score", 1.0))
-                        source = "sam3_anchor"
+                        source = "object_anchor"
                         instance_id = current_instance
                     elif frame_index == end_frame:
                         mask = decode_coco_rle(right_anchor["mask_rle"])
                         agreement = 1.0
                         component_fraction = 1.0
                         confidence = float(right_anchor.get("score", 1.0))
-                        source = "sam3_anchor"
+                        source = "object_anchor"
                         instance_id = current_instance
                     else:
                         mask, agreement, component_fraction = (
@@ -993,6 +1197,7 @@ def main() -> None:
                 current_instance = new_instance
 
             last_anchor = anchors[-1]
+            last_anchor_area = int(decode_coco_rle(last_anchor["mask_rle"]).sum())
             tail_start = int(last_anchor["frame_index"])
             tail_end = len(frames) - 1
             if tail_start <= tail_end:
@@ -1008,12 +1213,14 @@ def main() -> None:
                     if frame_index == tail_start:
                         mask = decode_coco_rle(last_anchor["mask_rle"])
                         component_fraction = 1.0
-                        source = "sam3_anchor"
+                        source = "object_anchor"
                     else:
                         mask, component_fraction = primary_component(
                             tail_masks[frame_index]
                         )
-                        if component_fraction < 0.65:
+                        if component_fraction < 0.65 or not propagated_mask_is_plausible(
+                            mask, last_anchor_area
+                        ):
                             mask = None
                         source = (
                             "cutie_forward_tail"
@@ -1040,6 +1247,38 @@ def main() -> None:
     del model
     if device_name == "mps":
         torch.mps.empty_cache()
+
+    final_labels, clip_label_details = clip_label_tracks(
+        root=Path(__file__).resolve().parents[1],
+        frames=frames,
+        masks_by_object=masks_by_object,
+        confidence_by_object=confidence_by_object,
+        fallback_labels=labels,
+        target_labels=target_labels,
+        device_name=device_name,
+    )
+    labels = final_labels
+    if clip_label_details:
+        save_json(
+            {
+                "backend": "clip-vit-base-patch32",
+                "target_labels": target_labels,
+                "probability_threshold": CLIP_LABEL_PROB_THRESHOLD,
+                "tracks": list(clip_label_details.values()),
+            },
+            paths["work"] / "clip_track_labels.json",
+        )
+        selected_objects = discovery_summary.get("selected_objects", [])
+        for item in selected_objects:
+            object_id = int(item["object_id"])
+            if object_id in clip_label_details:
+                item["pre_clip_label"] = item.get("pre_clip_label", item.get("label"))
+                item["label"] = clip_label_details[object_id]["label"]
+                item["clip_score"] = clip_label_details[object_id]["clip_score"]
+                item["clip_accepted"] = clip_label_details[object_id]["accepted"]
+        discovery_summary["selected_objects"] = selected_objects
+        discovery_summary["labeling_backend"] = "clip-vit-base-patch32"
+        save_json(discovery_summary, discovery_summary_path)
 
     timestamp_table = pq.read_table(
         paths["source"] / "frame_timestamps.parquet"

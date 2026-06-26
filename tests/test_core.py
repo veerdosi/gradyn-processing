@@ -78,26 +78,24 @@ def test_default_object_discovery_strides(
         output=tmp_path / "result",
         camera="Test Camera",
     )
-    assert config.discover_objects is False
-    assert config.qwen_stride == 360
-    assert config.sam3_stride == 90
-    assert config.qwen_max_candidates == 24
+    assert config.anchor_stride == 90
+    assert config.anchor_backend == "grounding_dino_sam2_dinov2"
+    assert config.anchor_device == "auto"
     assert config.depth_every == 1
     assert config.depth_input_size == 756
     assert config.depth_backend == "depth_anything_v2_small_relative"
 
 
-def test_disabled_object_discovery_preserves_legacy_config_hash(
+def test_config_hash_uses_stable_json_payload(
     tmp_path: Path,
 ) -> None:
     config = ProcessConfig(
         video=tmp_path / "video.mp4",
         output=tmp_path / "result",
         camera="Test Camera",
-        objects=["paper sheet"],
+        target_labels=["paper sheet"],
     )
     payload = config.model_dump(mode="json")
-    payload.pop("discover_objects")
     payload["video"] = str(config.video.resolve())
     payload["output"] = str(config.output.resolve())
     expected = hashlib.sha256(
@@ -145,6 +143,6 @@ def test_preprocessing_can_be_reused_when_only_downstream_config_changes(
         video=video,
         output=paths.root,
         camera="DJI Osmo Nano",
-        objects=["paper sheet", "laminator"],
+        target_labels=["paper sheet", "laminator"],
     )
     assert reusable_preprocessing(config, paths)
