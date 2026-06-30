@@ -364,11 +364,6 @@ def doctor() -> None:
             "print({'mps': torch.backends.mps.is_available(), "
             "'transformers': transformers.__version__, 'sam2': True})",
         ),
-        "vocab": _environment_check(
-            "gradyn-vocab",
-            "import mlx.core as mx, mlx_vlm; "
-            "print({'metal': mx.metal.is_available(), 'mlx_vlm': True})",
-        ),
         "inference": _environment_check(
             "gradyn-inference",
             "import torch, cv2, cutie; "

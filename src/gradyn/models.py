@@ -13,10 +13,6 @@ from .runtime import conda_environment_python, project_root, run_command
 console = Console()
 
 REPOSITORIES = {
-    "mlx-sam3": (
-        "https://github.com/Deekshith-Dade/mlx_sam3.git",
-        "d9a92badb6000a93135e01b89cd81a54e7ff9825",
-    ),
     "sam2": (
         "https://github.com/facebookresearch/sam2.git",
         "main",

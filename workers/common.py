@@ -12,8 +12,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from PIL import Image, ImageDraw
 
-SAM3_NATIVE_RESOLUTION = 1008
-
 
 def chunk_ranges(frame_count: int, chunk_frames: int, overlap: int) -> list[tuple[int, int]]:
     if chunk_frames <= 0:
@@ -28,29 +26,6 @@ def chunk_ranges(frame_count: int, chunk_frames: int, overlap: int) -> list[tupl
         if end == frame_count:
             break
     return ranges
-
-
-def load_prompt_bank(path: str | Path) -> dict:
-    bank_path = Path(path).expanduser().resolve()
-    if not bank_path.exists():
-        raise ValueError(f"Prompt bank does not exist: {bank_path}")
-    data = json.loads(bank_path.read_text())
-    prompts = data.get("prompts")
-    if not isinstance(prompts, list) or not prompts:
-        raise ValueError(f"Prompt bank must contain a non-empty prompts list: {bank_path}")
-    normalized = [str(prompt).strip() for prompt in prompts if str(prompt).strip()]
-    if not normalized:
-        raise ValueError(f"Prompt bank contains no usable prompts: {bank_path}")
-    if len(normalized) != len(set(normalized)):
-        raise ValueError(f"Prompt bank contains duplicate prompts: {bank_path}")
-    return {
-        "path": str(bank_path),
-        "schema_version": str(data.get("schema_version", "1.0")),
-        "name": str(data.get("name", bank_path.stem)),
-        "description": str(data.get("description", "")),
-        "task": str(data.get("task", "")),
-        "prompts": normalized,
-    }
 
 
 def job_paths(job: str | Path) -> dict[str, Path]:

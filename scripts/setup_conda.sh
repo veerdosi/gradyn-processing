@@ -36,7 +36,7 @@ env_exists() {
   "$CONDA_BIN" env list | awk '{print $1}' | grep -qx "$1"
 }
 
-for spec in core vocab objects inference; do
+for spec in core objects inference; do
   env_name="gradyn-${spec}"
   if env_exists "$env_name"; then
     echo "Updating Conda environment $env_name…"
@@ -50,10 +50,6 @@ done
 "$CONDA_BIN" run -n gradyn-core python -m pip install -e "$ROOT"
 "$CONDA_BIN" run -n gradyn-core python "$ROOT/scripts/patch_wilor.py"
 "$CONDA_BIN" run -n gradyn-core python "$ROOT/scripts/patch_cutie.py"
-"$CONDA_BIN" run -n gradyn-vocab python -m pip install \
-  "numpy>=2,<2.3" "opencv-python==4.12.0.88" \
-  "torch==2.5.1" "torchvision==0.20.1" \
-  "transformers==4.57.3" "mlx-lm==0.29.1" "mlx-vlm==0.3.4"
 "$CONDA_BIN" run -n gradyn-inference python -m pip install \
   "numpy==1.26.4" "torch==2.5.1" "torchvision==0.20.1" \
   pytorch-lightning==2.2.4 lightning-utilities \
