@@ -127,6 +127,10 @@ def _parse_exemplars(values: list[str]) -> dict[str, Path]:
     return parsed
 
 
+def _split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 @app.command()
 def process(
     video: Path = typer.Argument(..., exists=True, dir_okay=False),
@@ -140,11 +144,19 @@ def process(
             "resolution and camera mode."
         ),
     ),
+    objects: str = typer.Option(
+        "",
+        "--objects",
+        help=(
+            "Comma-separated object names to actively track. Mutually exclusive "
+            "with --target-labels."
+        ),
+    ),
     target_labels: str = typer.Option(
         "",
         "--target-labels",
         help=(
-            "Comma-separated labels CLIP may assign after object tracking."
+            "Comma-separated label vocabulary for automatic object discovery."
         ),
     ),
     max_auto_objects: int = typer.Option(
@@ -183,7 +195,13 @@ def process(
     ),
     no_resume: bool = typer.Option(False),
 ) -> None:
-    label_names = [item.strip() for item in target_labels.split(",") if item.strip()]
+    object_names = _split_csv(objects)
+    label_names = _split_csv(target_labels)
+    if object_names and label_names:
+        raise typer.BadParameter("Use --objects or --target-labels, not both.")
+    active_labels = object_names or label_names
+    if object_names:
+        max_auto_objects = min(max_auto_objects, len(object_names))
     if anchor_device not in {"auto", "mps", "cpu"}:
         raise typer.BadParameter("--anchor-device must be auto, mps, or cpu")
     # missing = verify_models()
@@ -197,7 +215,8 @@ def process(
         output=output.resolve(),
         camera=camera,
         focal_length_px=focal_length_px,
-        target_labels=label_names,
+        target_labels=active_labels,
+        object_mode=bool(object_names),
         max_auto_objects=max_auto_objects,
         anchor_stride=anchor_stride,
         anchor_device=anchor_device,
@@ -208,6 +227,123 @@ def process(
     )
     run_pipeline(config, skip_depth=skip_depth)
     console.print(f"[bold green]Complete:[/bold green] {config.output}")
+
+
+@app.command("probe-objects")
+def probe_objects(
+    video: Path = typer.Argument(..., exists=True, dir_okay=False),
+    prompts: str = typer.Option(
+        "",
+        "--prompts",
+        help="Comma-separated GroundingDINO prompts to compare.",
+    ),
+    prompt: list[str] = typer.Option(
+        [],
+        "--prompt",
+        help="One GroundingDINO prompt. Can be repeated.",
+    ),
+    frames: str = typer.Option(
+        "",
+        "--frames",
+        help="Optional comma-separated source frame numbers. Defaults to evenly spaced frames.",
+    ),
+    frame_count: int = typer.Option(
+        3,
+        "--frame-count",
+        min=1,
+        max=12,
+        help="Number of evenly spaced frames to probe when --frames is omitted.",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "-o",
+        "--output",
+        help="Probe output directory. Defaults to object-prompt-probes/VIDEO_NAME.",
+    ),
+    device: str = typer.Option(
+        "auto",
+        "--device",
+        help="Device for GroundingDINO + SAM2.1 probe: auto, mps, or cpu.",
+    ),
+    box_threshold: float = typer.Option(
+        0.15,
+        "--box-threshold",
+        min=0.0,
+        max=1.0,
+        help="GroundingDINO box threshold.",
+    ),
+    text_threshold: float = typer.Option(
+        0.12,
+        "--text-threshold",
+        min=0.0,
+        max=1.0,
+        help="GroundingDINO text threshold.",
+    ),
+    top_k: int = typer.Option(
+        8,
+        "--top-k",
+        min=1,
+        max=30,
+        help="Maximum boxes to send to SAM2 per prompt per frame.",
+    ),
+    max_side: int = typer.Option(
+        960,
+        "--max-side",
+        min=320,
+        max=1600,
+        help="Maximum inference side for the probe frames.",
+    ),
+) -> None:
+    """Compare object-detection prompts on a few frames without tracking."""
+    from .runtime import run_worker
+
+    prompt_values = [*prompt, *_split_csv(prompts)]
+    prompt_values = [value.strip() for value in prompt_values if value.strip()]
+    if not prompt_values:
+        raise typer.BadParameter("Pass at least one --prompt or --prompts value.")
+    if len(prompt_values) != len(set(prompt_values)):
+        raise typer.BadParameter("Prompt list contains duplicates.")
+    if device not in {"auto", "mps", "cpu"}:
+        raise typer.BadParameter("--device must be auto, mps, or cpu")
+    try:
+        frame_values = [int(item) for item in _split_csv(frames)]
+    except ValueError as error:
+        raise typer.BadParameter("--frames must be comma-separated integers") from error
+    if any(value < 0 for value in frame_values):
+        raise typer.BadParameter("--frames cannot contain negative values")
+    output_dir = (
+        output.expanduser().resolve()
+        if output is not None
+        else (project_root() / "object-prompt-probes" / video.stem).resolve()
+    )
+    run_worker(
+        "gradyn-objects",
+        "probe_grounded_sam2.py",
+        [
+            "--video",
+            str(video.expanduser().resolve()),
+            "--prompts-json",
+            json.dumps(prompt_values),
+            "--frames-json",
+            json.dumps(frame_values),
+            "--frame-count",
+            str(frame_count),
+            "--output",
+            str(output_dir),
+            "--device",
+            device,
+            "--box-threshold",
+            str(box_threshold),
+            "--text-threshold",
+            str(text_threshold),
+            "--top-k",
+            str(top_k),
+            "--max-side",
+            str(max_side),
+        ],
+    )
+    console.print(f"[bold green]Prompt probe saved:[/bold green] {output_dir}")
+    console.print(f"Open {output_dir / 'contact_sheet.jpg'}")
 
 
 @app.command()
@@ -359,6 +495,8 @@ def rebuild_objects(
         "--device",
         str(config.get("anchor_device", "auto")),
     ]
+    if bool(config.get("object_mode", False)):
+        anchor_args.append("--object-mode")
     manual_seeds = root / "objects" / "manual_seeds.json"
     if manual_seeds.exists():
         anchor_args.extend(["--manual-seeds-json", str(manual_seeds)])

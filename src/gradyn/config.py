@@ -13,6 +13,7 @@ class ProcessConfig(BaseModel):
     camera: str
     focal_length_px: float | None = None
     target_labels: list[str] = Field(default_factory=list)
+    object_mode: bool = False
     max_auto_objects: int = 8
     exemplars: dict[str, Path] = Field(default_factory=dict)
     anchor_stride: int = 90

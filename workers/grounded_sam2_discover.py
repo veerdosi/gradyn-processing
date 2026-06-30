@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -28,8 +29,6 @@ BROAD_PROMPTS = [
     "component",
     "piece",
     "attachment",
-    "accessory",
-    "material",
     "workpiece",
     "block",
     "bar",
@@ -40,12 +39,26 @@ BROAD_PROMPTS = [
     "fastener",
     "hardware",
     "fixture",
-    "paper",
 ]
+MIN_LABEL_ANCHOR_CLIP_SCORE = 0.20
+MIN_LABEL_ANCHOR_AREA_FRACTION = 0.0008
+MAX_LABEL_CANDIDATES_PER_FRAME = 8
+
+
+def detection_prompts_for_labels(target_labels: list[str]) -> list[str]:
+    if target_labels:
+        return [prompt.strip() for prompt in target_labels if prompt.strip()]
+    prompts: list[str] = []
+    for prompt in BROAD_PROMPTS:
+        normalized = prompt.strip()
+        if normalized and normalized not in prompts:
+            prompts.append(normalized)
+    return prompts
 
 
 def choose_torch_device(requested: str):
     import torch
+
     if requested == "auto":
         return torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     if requested == "mps" and not torch.backends.mps.is_available():
@@ -186,6 +199,142 @@ def select_diverse_clusters(
     return selected
 
 
+def best_item_by_frame(items: list[dict], label: str | None = None) -> dict[int, dict]:
+    by_frame: dict[int, dict] = {}
+    for item in items:
+        frame_index = int(item["frame_index"])
+        current = by_frame.get(frame_index)
+        item_quality = float(item["detector_score"]) * float(item["sam2_mask_score"])
+        if label is not None:
+            item_quality *= max(float(item.get("clip_logits", {}).get(label, 0.0)), 1e-6)
+        current_quality = -1.0
+        if current is not None:
+            current_quality = float(current["detector_score"]) * float(
+                current["sam2_mask_score"]
+            )
+            if label is not None:
+                current_quality *= max(
+                    float(current.get("clip_logits", {}).get(label, 0.0)),
+                    1e-6,
+                )
+        if item_quality > current_quality:
+            by_frame[frame_index] = item
+    return by_frame
+
+
+def label_cluster_score(
+    items: list[dict],
+    label: str,
+    keyframe_count: int,
+    logit_floor: float,
+    logit_ceiling: float,
+) -> float:
+    physical_score = cluster_score(items, keyframe_count)
+    label_logits = np.asarray(
+        [float(item.get("clip_logits", {}).get(label, 0.0)) for item in items],
+        dtype=np.float32,
+    )
+    if len(label_logits) == 0:
+        return physical_score
+    span = max(logit_ceiling - logit_floor, 1e-6)
+    normalized = np.clip((label_logits - logit_floor) / span, 0.0, 1.0)
+    top_label = float(np.percentile(normalized, 80))
+    median_label = float(np.median(normalized))
+    return 0.50 * top_label + 0.25 * median_label + 0.25 * physical_score
+
+
+def candidate_matches_label(item: dict, label: str) -> bool:
+    return float(item["area_fraction"]) >= MIN_LABEL_ANCHOR_AREA_FRACTION
+
+
+def select_label_anchor_chains(
+    candidates: list[dict],
+    target_labels: list[str],
+    keyframe_count: int,
+    similarity_threshold: float,
+) -> list[tuple[str, float, list[dict], dict]]:
+    selected: list[tuple[str, float, list[dict], dict]] = []
+    occupied_representatives: list[np.ndarray] = []
+    for label in target_labels:
+        by_frame_candidates: dict[int, list[dict]] = {}
+        for item in candidates:
+            if candidate_matches_label(item, label):
+                by_frame_candidates.setdefault(int(item["frame_index"]), []).append(item)
+        label_candidates = []
+        for frame_items in by_frame_candidates.values():
+            label_candidates.extend(
+                sorted(
+                    frame_items,
+                    key=lambda item: float(item.get("clip_logits", {}).get(label, 0.0)),
+                    reverse=True,
+                )[:MAX_LABEL_CANDIDATES_PER_FRAME]
+            )
+        if not label_candidates:
+            continue
+        label_logits = [
+            float(item.get("clip_logits", {}).get(label, 0.0))
+            for item in label_candidates
+        ]
+        logit_floor = min(label_logits)
+        logit_ceiling = max(label_logits)
+        clusters: list[tuple[float, list[dict], dict]] = []
+        for indices in cluster_embeddings(label_candidates, similarity_threshold):
+            items = [label_candidates[index] for index in indices]
+            frames_seen = {int(item["frame_index"]) for item in items}
+            if len(frames_seen) < 2 and keyframe_count >= 3:
+                continue
+            representative = items[representative_index(items)]
+            rep_box = np.asarray(representative["box_xyxy"], dtype=np.float32)
+            if any(box_iou(rep_box, occupied) > 0.65 for occupied in occupied_representatives):
+                continue
+            clusters.append(
+                (
+                    label_cluster_score(
+                        items,
+                        label,
+                        keyframe_count,
+                        logit_floor,
+                        logit_ceiling,
+                    ),
+                    items,
+                    representative,
+                )
+            )
+        if not clusters:
+            continue
+        score, items, representative = max(clusters, key=lambda value: value[0])
+        selected.append((label, score, items, representative))
+        occupied_representatives.append(
+            np.asarray(representative["box_xyxy"], dtype=np.float32)
+        )
+    return selected
+
+
+def select_object_prompt_anchors(
+    candidates: list[dict],
+    target_labels: list[str],
+) -> list[tuple[str, float, list[dict], dict]]:
+    selected: list[tuple[str, float, list[dict], dict]] = []
+    for label in target_labels:
+        label_items = [
+            item
+            for item in candidates
+            if str(item.get("prompt", "")).casefold() == label.casefold()
+        ]
+        by_frame = best_item_by_frame(label_items)
+        items = sorted(by_frame.values(), key=lambda item: int(item["frame_index"]))
+        if not items:
+            continue
+        qualities = [
+            float(item["detector_score"]) * float(item["sam2_mask_score"])
+            for item in items
+        ]
+        representative = items[int(np.argmax(np.asarray(qualities, dtype=np.float32)))]
+        score = float(np.median(qualities))
+        selected.append((label, score, items, representative))
+    return selected
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True)
@@ -196,35 +345,43 @@ def main() -> None:
     parser.add_argument("--stride", type=int, default=90)
     parser.add_argument("--max-side", type=int, default=960)
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
-    parser.add_argument("--box-threshold", type=float, default=0.15)
+    parser.add_argument("--box-threshold", type=float, default=0.20)
     parser.add_argument("--text-threshold", type=float, default=0.12)
     parser.add_argument("--cluster-similarity", type=float, default=0.72)
+    parser.add_argument("--object-mode", action="store_true")
     args = parser.parse_args()
 
     import torch
-    from transformers import AutoImageProcessor, AutoModel, AutoModelForZeroShotObjectDetection, AutoProcessor
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
     root = Path(__file__).resolve().parents[1]
     sam2_repo = root / "models" / "sam2"
     sam2_checkpoint = sam2_repo / "checkpoints" / "sam2.1_hiera_small.pt"
     grounding_dino_dir = root / "models" / "grounding-dino-base"
     dinov2_dir = root / "models" / "dinov2-small"
-    for required, message in [
+    clip_home = root / "models" / "clip-home"
+    clip_checkpoint = clip_home / ".cache" / "clip" / "ViT-B-32.pt"
+    paths = job_paths(args.job)
+    frames = frame_paths(args.job)
+    target_labels: list[str] = json.loads(args.target_labels_json)
+    max_objects = min(args.max_auto_objects, len(target_labels) or args.max_auto_objects)
+    detection_prompts = detection_prompts_for_labels(target_labels)
+    required_assets = [
         (grounding_dino_dir / "config.json", "GroundingDINO base weights are missing."),
-        (dinov2_dir / "config.json", "DINOv2 small weights are missing."),
         (sam2_repo / "sam2" / "__init__.py", "SAM2 repository is missing."),
         (sam2_checkpoint, "SAM2.1 small weights are missing."),
-    ]:
+    ]
+    if not args.object_mode:
+        required_assets.append((dinov2_dir / "config.json", "DINOv2 small weights are missing."))
+    if target_labels and not args.object_mode:
+        required_assets.append((clip_checkpoint, "CLIP ViT-B/32 weights are missing."))
+    for required, message in required_assets:
         if not required.exists():
             raise SystemExit(message + " Run `gradyn models setup`.")
     sys.path.insert(0, str(sam2_repo))
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    paths = job_paths(args.job)
-    frames = frame_paths(args.job)
-    target_labels: list[str] = json.loads(args.target_labels_json)
-    max_objects = min(args.max_auto_objects, len(target_labels) or args.max_auto_objects)
     keyframes = [0, *range(args.stride, len(frames), args.stride)]
     keyframes = sorted(set(i for i in keyframes if 0 <= i < len(frames)))
 
@@ -240,7 +397,13 @@ def main() -> None:
         "box_threshold": args.box_threshold,
         "text_threshold": args.text_threshold,
         "cluster_similarity": args.cluster_similarity,
-        "selector": "broad_grounding_dino_sam2_dinov2_cluster_v2",
+        "detection_prompts": detection_prompts,
+        "object_mode": bool(args.object_mode),
+        "selector": (
+            "object_prompt_grounding_dino_sam2_anchors_v1"
+            if args.object_mode
+            else "target_aware_grounding_dino_sam2_cliplogit_dinov2_label_chains_v1"
+        ),
     }
     if checkpoint_meta.exists() and json.loads(checkpoint_meta.read_text()).get("signature") != signature:
         shutil.rmtree(checkpoint_dir)
@@ -249,18 +412,47 @@ def main() -> None:
 
     device = choose_torch_device(args.device)
     cpu_device = torch.device("cpu")
-    print(
-        f"Loading GroundingDINO base, SAM2.1 small, and DINOv2 small on {device.type}.",
-        flush=True,
-    )
+    if args.object_mode:
+        print(f"Loading GroundingDINO base and SAM2.1 small on {device.type}.", flush=True)
+    else:
+        print(
+            f"Loading GroundingDINO base, SAM2.1 small, and DINOv2 small on {device.type}.",
+            flush=True,
+        )
     gd_processor = AutoProcessor.from_pretrained(str(grounding_dino_dir))
     gd_model = AutoModelForZeroShotObjectDetection.from_pretrained(str(grounding_dino_dir)).to(device).eval()
     sam2_model = build_sam2(SAM2_CONFIG, str(sam2_checkpoint), device=device, mode="eval")
     sam2 = SAM2ImagePredictor(sam2_model)
-    dino_processor = AutoImageProcessor.from_pretrained(str(dinov2_dir))
-    dino_model = AutoModel.from_pretrained(str(dinov2_dir)).to(device).eval()
+    dino_processor = None
+    dino_model = None
+    clip_model = None
+    clip_preprocess = None
+    clip_text = None
+    if not args.object_mode:
+        from transformers import AutoImageProcessor, AutoModel
 
-    print(f"Object discovery will inspect {len(keyframes)} keyframes with broad prompts.", flush=True)
+        dino_processor = AutoImageProcessor.from_pretrained(str(dinov2_dir))
+        dino_model = AutoModel.from_pretrained(str(dinov2_dir)).to(device).eval()
+    if target_labels and not args.object_mode:
+        import clip
+
+        previous_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(clip_home)
+        try:
+            clip_model, clip_preprocess = clip.load("ViT-B/32", device=device, download_root=None)
+        finally:
+            if previous_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous_home
+        clip_model.eval()
+        clip_text = clip.tokenize([f"a photo of a {label}" for label in target_labels]).to(device)
+
+    print(
+        f"Object discovery will inspect {len(keyframes)} keyframes with "
+        f"{len(detection_prompts)} detector prompts.",
+        flush=True,
+    )
     candidates: list[dict] = []
     for number, frame_index in enumerate(keyframes, start=1):
         cached_path = checkpoint_dir / f"{frame_index:08d}.json"
@@ -275,7 +467,7 @@ def main() -> None:
         width, height = image.size
         sam2.set_image(np.asarray(image).copy())
         frame_boxes: list[tuple[np.ndarray, float, str]] = []
-        for prompt in BROAD_PROMPTS:
+        for prompt in detection_prompts:
             inputs = gd_processor(images=image, text=[[prompt]], return_tensors="pt").to(device)
             with torch.inference_mode():
                 outputs = gd_model(**inputs)
@@ -305,11 +497,34 @@ def main() -> None:
                 if not mask_passes_geometry(binary, mask_box):
                     continue
                 crop = crop_square(image, mask_box)
-                dino_inputs = dino_processor(images=crop, return_tensors="pt").to(device)
-                with torch.inference_mode():
-                    features = dino_model(**dino_inputs).last_hidden_state[:, 0, :]
-                embedding = features[0].detach().to(cpu_device).float().numpy()
-                embedding /= max(float(np.linalg.norm(embedding)), 1e-9)
+                embedding: list[float] | None = None
+                if dino_processor is not None and dino_model is not None:
+                    dino_inputs = dino_processor(images=crop, return_tensors="pt").to(device)
+                    with torch.inference_mode():
+                        features = dino_model(**dino_inputs).last_hidden_state[:, 0, :]
+                    embedding_array = features[0].detach().to(cpu_device).float().numpy()
+                    embedding_array /= max(float(np.linalg.norm(embedding_array)), 1e-9)
+                    embedding = embedding_array.tolist()
+                clip_scores: dict[str, float] = {}
+                clip_logits: dict[str, float] = {}
+                clip_best_prompt = None
+                if clip_text is not None and clip_model is not None and clip_preprocess is not None:
+                    clip_image = clip_preprocess(crop).unsqueeze(0).to(device)
+                    with torch.inference_mode():
+                        logits_per_image, _ = clip_model(clip_image, clip_text)
+                    raw_logits = logits_per_image[0].detach().to(cpu_device).numpy()
+                    clip_logits = {
+                        label: float(raw_logits[index])
+                        for index, label in enumerate(target_labels)
+                    }
+                    probabilities = (
+                        logits_per_image.softmax(dim=1)[0].detach().to(cpu_device).numpy()
+                    )
+                    clip_scores = {
+                        label: float(probabilities[index])
+                        for index, label in enumerate(target_labels)
+                    }
+                    clip_best_prompt = target_labels[int(raw_logits.argmax())]
                 output_mask = binary
                 output_box = mask_box.copy()
                 if scale != 1.0:
@@ -320,58 +535,77 @@ def main() -> None:
                 area_fraction = float(binary.sum() / max(width * height, 1))
                 aspect_ratio = max(float(mask_box[2] - mask_box[0]), 1.0) / max(float(mask_box[3] - mask_box[1]), 1.0)
                 aspect_ratio = max(aspect_ratio, 1.0 / aspect_ratio)
-                frame_candidates.append({
+                candidate = {
                     "frame_index": frame_index,
                     "prompt": prompt,
                     "detector_score": detector_score,
                     "sam2_mask_score": float(sam2_score),
                     "box_xyxy": [float(v) for v in output_box.tolist()],
                     "mask_rle": encode_coco_rle(output_mask),
-                    "embedding": embedding.tolist(),
+                    "clip_scores": clip_scores,
+                    "clip_logits": clip_logits,
+                    "clip_best_prompt": clip_best_prompt,
                     "area_fraction": area_fraction,
                     "aspect_ratio": aspect_ratio,
-                })
+                }
+                if embedding is not None:
+                    candidate["embedding"] = embedding
+                frame_candidates.append(candidate)
         save_json(frame_candidates, cached_path)
         candidates.extend(frame_candidates)
         if device.type == "mps":
             torch.mps.empty_cache()
 
-    clusters = []
-    for indices in cluster_embeddings(candidates, args.cluster_similarity):
-        items = [candidates[i] for i in indices]
-        frames_seen = {int(item["frame_index"]) for item in items}
-        if len(frames_seen) < 2 and len(keyframes) >= 3:
-            continue
-        score = cluster_score(items, len(keyframes))
-        rep = items[representative_index(items)]
-        clusters.append((score, items, rep))
-    clusters.sort(key=lambda value: value[0], reverse=True)
-    selected = select_diverse_clusters(clusters, max_objects)
+    if args.object_mode:
+        selected_label_chains = select_object_prompt_anchors(candidates, target_labels[:max_objects])
+    elif target_labels:
+        selected_label_chains = select_label_anchor_chains(
+            candidates,
+            target_labels[:max_objects],
+            len(keyframes),
+            args.cluster_similarity,
+        )
+    else:
+        clusters = []
+        for indices in cluster_embeddings(candidates, args.cluster_similarity):
+            items = [candidates[i] for i in indices]
+            frames_seen = {int(item["frame_index"]) for item in items}
+            if len(frames_seen) < 2 and len(keyframes) >= 3:
+                continue
+            score = cluster_score(items, len(keyframes))
+            rep = items[representative_index(items)]
+            clusters.append((score, items, rep))
+        clusters.sort(key=lambda value: value[0], reverse=True)
+        selected_label_chains = [
+            (f"unknown object {index}", score, items, rep)
+            for index, (score, items, rep) in enumerate(
+                select_diverse_clusters(clusters, max_objects),
+                start=1,
+            )
+        ]
 
     discoveries: list[dict] = []
     selected_objects: list[dict] = []
-    for object_id, (score, items, rep) in enumerate(selected, start=1):
-        label = f"unknown object {object_id}"
+    for object_id, (label, score, items, rep) in enumerate(selected_label_chains, start=1):
         selected_objects.append({
             "object_id": object_id,
             "label": label,
-            "pre_clip_label": label,
+            "label_source": (
+                "user_object_names"
+                if args.object_mode
+                else "clip_anchor_selection"
+                if target_labels
+                else "generic_cluster"
+            ),
             "cluster_score": float(score),
             "keyframe_hits": len({int(item["frame_index"]) for item in items}),
             "representative_frame": int(rep["frame_index"]),
+            "representative_clip_scores": rep.get("clip_scores", {}),
         })
-        by_frame: dict[int, dict] = {}
-        for item in items:
-            frame_index = int(item["frame_index"])
-            current = by_frame.get(frame_index)
-            item_quality = float(item["detector_score"]) * float(item["sam2_mask_score"])
-            current_quality = (
-                float(current["detector_score"]) * float(current["sam2_mask_score"])
-                if current is not None
-                else -1.0
-            )
-            if item_quality > current_quality:
-                by_frame[frame_index] = item
+        by_frame = best_item_by_frame(
+            items,
+            None if args.object_mode else (label if target_labels else None),
+        )
         for item in sorted(by_frame.values(), key=lambda value: int(value["frame_index"])):
             copied = {k: v for k, v in item.items() if k != "embedding"}
             copied.update({
@@ -382,15 +616,40 @@ def main() -> None:
                 "anchor_confidence": float(score),
                 "cluster_size": len(items),
                 "representative_frame": int(rep["frame_index"]),
-                "box_prompt_source": "broad_grounding_dino_sam2_dinov2_cluster",
+                "box_prompt_source": (
+                    "object_prompt_grounding_dino_sam2"
+                    if args.object_mode
+                    else "broad_grounding_dino_sam2_clip_dinov2_label_chain"
+                    if target_labels
+                    else "broad_grounding_dino_sam2_dinov2_cluster"
+                ),
             })
             discoveries.append(copied)
 
     save_json({
-        "mode": "object_agnostic_anchor_clustering",
-        "anchor_backend": "broad_grounding_dino_sam2_dinov2_cluster",
+        "mode": (
+            "object_prompt_anchor_selection"
+            if args.object_mode
+            else "label_specific_anchor_clustering"
+            if target_labels
+            else "object_agnostic_anchor_clustering"
+        ),
+        "anchor_backend": (
+            "object_prompt_grounding_dino_sam2"
+            if args.object_mode
+            else "broad_grounding_dino_sam2_clip_dinov2_label_chain"
+            if target_labels
+            else "broad_grounding_dino_sam2_dinov2_cluster"
+        ),
         "target_labels": target_labels,
         "selected_objects": selected_objects,
+        "labeling_backend": (
+            "user_object_names"
+            if args.object_mode
+            else "clip_anchor_selection"
+            if target_labels
+            else None
+        ),
     }, paths["objects"] / "discovery.json")
     save_json(discoveries, paths["work"] / "anchor_discoveries.json")
     shutil.rmtree(checkpoint_dir, ignore_errors=True)

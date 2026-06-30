@@ -46,7 +46,7 @@ from the same capture mode with:
 ./gradyn process video.mp4 \
   --camera "DJI Osmo Nano" \
   --focal-length-px VALUE_FROM_CALIBRATION \
-  --prompt-bank prompt_banks/sample-metalwork.json \
+  --objects "paper sheet" \
   --output result
 ```
 

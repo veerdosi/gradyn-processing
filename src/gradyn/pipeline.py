@@ -96,6 +96,8 @@ def process(config: ProcessConfig, *, skip_depth: bool = False) -> None:
             "--device",
             config.anchor_device,
         ]
+        if config.object_mode:
+            args.append("--object-mode")
         manual_seeds = paths.objects / "manual_seeds.json"
         if manual_seeds.exists():
             args.extend(["--manual-seeds-json", str(manual_seeds)])

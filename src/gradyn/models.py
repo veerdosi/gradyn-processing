@@ -82,6 +82,15 @@ def install_model_runtime_dependencies() -> None:
     )
     run_command(
         [
+            objects_python,
+            "-m",
+            "pip",
+            "install",
+            "git+https://github.com/openai/CLIP.git",
+        ]
+    )
+    run_command(
+        [
             inference_python,
             "-m",
             "pip",

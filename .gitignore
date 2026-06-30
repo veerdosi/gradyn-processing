@@ -40,6 +40,13 @@ licensed_models/
 result/
 result-*/
 result_*/
+results/
+results-*/
+results_*/
+sample-*/
+sample_*/
+test-sample-*/
+test_sample-*/
 outputs/
 output/
 
@@ -50,7 +57,3 @@ PROGRESS.md
 *.partial
 *.download
 *.log
-
-test-sample-1
-test-sample-2
-test-sample-3

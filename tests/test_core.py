@@ -6,14 +6,18 @@ import subprocess
 from pathlib import Path
 
 import pyarrow.parquet as pq
+from typer.testing import CliRunner
 
 from gradyn.camera_profiles import resolve_camera_profile
+from gradyn import cli as cli_module
 from gradyn.cli import _checkpoint_status
 from gradyn.config import ProcessConfig
 from gradyn.paths import JobPaths
 from gradyn.pipeline import reusable_preprocessing
 from gradyn.preprocess import preprocess
 from gradyn.runtime import mark_stage
+
+runner = CliRunner()
 
 
 def test_preprocess_preserves_frame_mapping(tmp_path: Path) -> None:
@@ -102,6 +106,61 @@ def test_config_hash_uses_stable_json_payload(
         json.dumps(payload, sort_keys=True).encode()
     ).hexdigest()[:16]
     assert config.stable_hash() == expected
+
+
+def test_cli_objects_are_active_tracking_labels(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    captured: dict[str, ProcessConfig] = {}
+
+    def fake_pipeline(config: ProcessConfig, *, skip_depth: bool = False) -> None:
+        captured["config"] = config
+
+    monkeypatch.setattr(cli_module, "run_pipeline", fake_pipeline)
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "process",
+            str(video),
+            "--camera",
+            "Test Camera",
+            "--objects",
+            "paper sheet",
+            "--max-auto-objects",
+            "8",
+            "--output",
+            str(tmp_path / "result"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].target_labels == ["paper sheet"]
+    assert captured["config"].max_auto_objects == 1
+
+
+def test_cli_rejects_objects_and_target_labels_together(tmp_path: Path) -> None:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "process",
+            str(video),
+            "--camera",
+            "Test Camera",
+            "--objects",
+            "paper sheet",
+            "--target-labels",
+            "paper sheet,phone",
+            "--output",
+            str(tmp_path / "result"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Use --objects or --target-labels, not both" in result.output
 
 
 def test_dji_osmo_nano_profile_matches_sample_capture_mode() -> None:

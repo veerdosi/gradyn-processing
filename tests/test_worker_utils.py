@@ -35,7 +35,9 @@ from workers.grounded_sam2_discover import (
     cluster_embeddings,
     cluster_score,
     mask_passes_geometry,
+    candidate_matches_label,
     select_diverse_clusters,
+    select_label_anchor_chains,
 )
 
 
@@ -298,6 +300,116 @@ def test_object_cluster_selection_skips_duplicate_boxes() -> None:
         [10, 10, 50, 50],
         [80, 80, 120, 120],
     ]
+
+
+def test_label_anchor_chains_pick_one_physical_cluster_per_label() -> None:
+    candidates = [
+        {
+            "frame_index": 0,
+            "embedding": [1.0, 0.0],
+            "area_fraction": 0.01,
+            "aspect_ratio": 2.0,
+            "detector_score": 0.5,
+            "sam2_mask_score": 0.9,
+            "box_xyxy": [0, 0, 20, 20],
+            "clip_scores": {"hammer": 0.7, "chisel": 0.25},
+            "clip_logits": {"hammer": 30.0, "chisel": 22.0},
+        },
+        {
+            "frame_index": 10,
+            "embedding": [0.99, 0.01],
+            "area_fraction": 0.012,
+            "aspect_ratio": 2.1,
+            "detector_score": 0.5,
+            "sam2_mask_score": 0.9,
+            "box_xyxy": [1, 1, 21, 21],
+            "clip_scores": {"hammer": 0.72, "chisel": 0.28},
+            "clip_logits": {"hammer": 31.0, "chisel": 23.0},
+        },
+        {
+            "frame_index": 0,
+            "embedding": [0.0, 1.0],
+            "area_fraction": 0.006,
+            "aspect_ratio": 3.0,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [80, 80, 100, 120],
+            "clip_scores": {"hammer": 0.3, "chisel": 0.55},
+            "clip_logits": {"hammer": 21.0, "chisel": 29.0},
+        },
+        {
+            "frame_index": 10,
+            "embedding": [0.02, 0.98],
+            "area_fraction": 0.006,
+            "aspect_ratio": 3.1,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [82, 80, 102, 120],
+            "clip_scores": {"hammer": 0.28, "chisel": 0.58},
+            "clip_logits": {"hammer": 20.0, "chisel": 30.0},
+        },
+    ]
+    chains = select_label_anchor_chains(candidates, ["hammer", "chisel"], 2, 0.95)
+    assert [chain[0] for chain in chains] == ["hammer", "chisel"]
+    assert [len({item["frame_index"] for item in chain[2]}) for chain in chains] == [2, 2]
+
+
+def test_single_label_selection_uses_raw_clip_logits() -> None:
+    candidates = [
+        {
+            "frame_index": 0,
+            "embedding": [1.0, 0.0],
+            "area_fraction": 0.01,
+            "aspect_ratio": 1.5,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [0, 0, 20, 20],
+            "clip_scores": {"printed document": 1.0},
+            "clip_logits": {"printed document": 18.0},
+        },
+        {
+            "frame_index": 10,
+            "embedding": [0.99, 0.01],
+            "area_fraction": 0.01,
+            "aspect_ratio": 1.5,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [1, 1, 21, 21],
+            "clip_scores": {"printed document": 1.0},
+            "clip_logits": {"printed document": 18.2},
+        },
+        {
+            "frame_index": 0,
+            "embedding": [0.0, 1.0],
+            "area_fraction": 0.02,
+            "aspect_ratio": 1.3,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [80, 80, 130, 130],
+            "clip_scores": {"printed document": 1.0},
+            "clip_logits": {"printed document": 30.0},
+        },
+        {
+            "frame_index": 10,
+            "embedding": [0.01, 0.99],
+            "area_fraction": 0.02,
+            "aspect_ratio": 1.3,
+            "detector_score": 0.4,
+            "sam2_mask_score": 0.8,
+            "box_xyxy": [82, 80, 132, 130],
+            "clip_scores": {"printed document": 1.0},
+            "clip_logits": {"printed document": 31.0},
+        },
+    ]
+    chains = select_label_anchor_chains(candidates, ["printed document"], 2, 0.95)
+    assert len(chains) == 1
+    assert {
+        tuple(item["box_xyxy"])
+        for item in chains[0][2]
+    } == {
+        (80, 80, 130, 130),
+        (82, 80, 132, 130),
+    }
 
 
 def test_temporal_hand_selection_prefers_continuous_candidate() -> None:

@@ -646,6 +646,8 @@ def main() -> None:
             discovery_summary.get("requested_labels", []),
         )
     ]
+    if discovery_summary.get("labeling_backend") == "clip_anchor_selection":
+        target_labels = []
     labels: dict[int, str] = {
         int(item["object_id"]): str(item["label"])
         for item in discovery_summary.get("selected_objects", [])
